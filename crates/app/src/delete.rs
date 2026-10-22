@@ -210,7 +210,10 @@ impl App {
             return;
         }
         if p.scan != self.scans {
-            self.toast("Список изменился после пересканирования — выберите файлы заново", ToastKind::Error);
+            self.toast(
+                "Список изменился после пересканирования — выберите файлы заново",
+                ToastKind::Error,
+            );
             return;
         }
         let Some(data) = self.data.clone() else { return };
@@ -226,6 +229,8 @@ impl App {
         } else {
             Vec::new()
         };
+        // The bins shown in the dialog are on the scanned volume; only that drive's bin is emptied.
+        let bin_drive = p.ids.first().and_then(|&b| tree.path(b).chars().next()).unwrap_or('C');
         let bin_children: Vec<NodeId> = if p.empty_bin {
             p.ids.iter().flat_map(|&b| tree.children(b).to_vec()).collect()
         } else {
@@ -255,7 +260,7 @@ impl App {
                     d2.fetch_add(w, Relaxed);
                 }
             } else if empty_bin {
-                match winint::empty_recycle_bin() {
+                match winint::empty_recycle_bin(bin_drive) {
                     Ok(()) => out.removed = bin_children,
                     Err(e) => out.failed.push(("Корзина".into(), e)),
                 }
@@ -272,8 +277,10 @@ impl App {
                             remove_file_progress(p, &d2)
                         }
                     } else if !recycle_safe(&path) {
-                        Err("имя оканчивается точкой или пробелом — Корзина такие не принимает, удалите безвозвратно"
-                            .into())
+                        Err(
+                            "имя оканчивается точкой или пробелом — Корзина такие не принимает, удалите безвозвратно"
+                                .into(),
+                        )
                     } else {
                         winint::recycle(&path)
                     };
@@ -594,4 +601,3 @@ mod tests {
         assert!(!recycle_safe(r"C:\dir \a.txt"));
     }
 }
-

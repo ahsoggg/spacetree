@@ -10,7 +10,8 @@ use std::path::Path;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileFullDirectoryInfo, GetDiskFreeSpaceExW, GetFileInformationByHandleEx, OPEN_EXISTING,
+    FileFullDirectoryInfo, GetDiskFreeSpaceExW, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -62,6 +63,43 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     // SAFETY: `src` is NUL-terminated; out-pointers reference live locals.
     let ok = unsafe { GetDiskFreeSpaceExW(src.as_ptr(), &mut avail, &mut total, &mut free) };
     (ok != 0 && total > 0).then_some((total, free))
+}
+
+/// Serial number of the volume that really holds the existing file or folder `path`: the open follows
+/// junctions, symbolic links, mount points and `subst` drives. `None` when it cannot be opened or queried.
+pub fn volume_serial(path: &Path) -> Option<u32> {
+    let p = wide(path);
+    // SAFETY: `p` is NUL-terminated; zero access with backup semantics opens files and folders alike.
+    let h = unsafe {
+        CreateFileW(
+            p.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let h = Handle(h);
+    let mut serial = 0u32;
+    // SAFETY: valid handle; only the serial out-pointer is passed, the optional buffers are null with size 0.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            h.0,
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (ok != 0).then_some(serial)
 }
 
 /// Whether the drive holding `path` is a spinning disk (`Some(true)`), an SSD (`Some(false)`), or unknown

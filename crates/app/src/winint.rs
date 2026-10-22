@@ -60,8 +60,8 @@ mod imp {
         RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW,
     };
     use windows_sys::Win32::UI::Shell::{
-        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
-        SHChangeNotify, SHEmptyRecycleBinW, SHFILEOPSTRUCTW, SHFileOperationW,
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+        SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, SHEmptyRecycleBinW, SHFILEOPSTRUCTW, SHFileOperationW,
     };
 
     use super::{APP, InstallOptions, REPO_URL, install_dir, installed_exe, same_file};
@@ -356,7 +356,9 @@ mod imp {
             wFunc: FO_DELETE,
             pFrom: from.as_ptr(),
             pTo: std::ptr::null(),
-            fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI) as u16,
+            // FOF_WANTNUKEWARNING: an item that cannot go to the bin (too big, no bin on that drive) would
+            // otherwise be destroyed silently although the user chose "to the recycle bin"; Windows asks first.
+            fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING) as u16,
             fAnyOperationsAborted: 0,
             hNameMappings: std::ptr::null_mut(),
             lpszProgressTitle: std::ptr::null(),
@@ -372,16 +374,18 @@ mod imp {
         }
     }
 
-    /// Empties the recycle bins of all drives, without Windows' own confirmation (we ask ourselves).
-    pub fn empty_recycle_bin() -> Result<(), String> {
+    /// Empties the recycle bin of the drive `drive` only (the one whose bin size the user was shown), without
+    /// Windows' own confirmation (we ask ourselves).
+    pub fn empty_recycle_bin(drive: char) -> Result<(), String> {
         const SHERB_NOCONFIRMATION: u32 = 1;
         const SHERB_NOPROGRESSUI: u32 = 2;
         const SHERB_NOSOUND: u32 = 4;
-        // SAFETY: null root = all drives; no window handle.
+        let root: Vec<u16> = format!("{drive}:\\").encode_utf16().chain([0]).collect();
+        // SAFETY: `root` is NUL-terminated and outlives the call; no window handle.
         let hr = unsafe {
             SHEmptyRecycleBinW(
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                root.as_ptr(),
                 SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND,
             )
         };
@@ -430,7 +434,7 @@ mod imp_stub {
     pub fn recycle(_: &str) -> Result<(), String> {
         Err(NA.into())
     }
-    pub fn empty_recycle_bin() -> Result<(), String> {
+    pub fn empty_recycle_bin(_drive: char) -> Result<(), String> {
         Err(NA.into())
     }
 }

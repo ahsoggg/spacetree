@@ -340,7 +340,8 @@ impl App {
 
     fn start_deep_scan(&mut self, ctx: &egui::Context) {
         let Some(res) = self.recover.result.clone() else { return };
-        let drive = self.recover.drive;
+        // The drive the result came from, not whatever the combo shows now.
+        let drive = res.drive;
         let known = res.start_lcns();
         let progress = Arc::new(Progress::default());
         let (tx, rx) = channel();
@@ -358,7 +359,7 @@ impl App {
     fn load_preview(&mut self, i: usize) {
         let Some(res) = self.recover.result.clone() else { return };
         self.recover.selected = Some(i);
-        self.recover.preview = match undelete::Volume::open(self.recover.drive) {
+        self.recover.preview = match undelete::Volume::open(res.drive) {
             Ok(v) => describe(&v.head(&res.files[i], 512)),
             Err(e) => e.to_string(),
         };
@@ -388,9 +389,9 @@ impl App {
 
     #[cfg(windows)]
     fn start_restore(&mut self, ctx: &egui::Context) {
-        let (Some(res), drive) = (self.recover.result.clone(), self.recover.drive) else {
-            return;
-        };
+        let Some(res) = self.recover.result.clone() else { return };
+        // Cluster numbers of the result only mean something on the volume that was scanned.
+        let drive = res.drive;
         let mut ids: Vec<usize> = self.recover.marked.iter().copied().collect();
         ids.sort_unstable();
         let dest = PathBuf::from(self.recover.dest.trim());

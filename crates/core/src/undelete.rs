@@ -242,12 +242,18 @@ fn data_attr(attr: &[u8]) -> Option<Data> {
     }
     let start_vcn = u64_at(attr, 0x10);
     let roff = u16_at(attr, 0x20) as usize;
-    let (mut runs, bad_runs) = match ntfs::parse_runs(attr.get(roff..).unwrap_or(&[])) {
+    let (mut runs, mut bad_runs) = match ntfs::parse_runs(attr.get(roff..).unwrap_or(&[])) {
         Ok(r) => (r, false),
         Err(_) => (Vec::new(), true),
     };
     for r in &mut runs {
-        r.vcn += start_vcn;
+        match r.vcn.checked_add(start_vcn).filter(|v| v.checked_add(r.len).is_some()) {
+            Some(v) => r.vcn = v,
+            None => bad_runs = true,
+        }
+    }
+    if bad_runs {
+        runs.clear();
     }
     Some(Data {
         // Sizes are only meaningful in the first extent.
@@ -256,7 +262,9 @@ fn data_attr(attr: &[u8]) -> Option<Data> {
         start_vcn,
         flags: u16_at(attr, 0x0C),
         unit: if u16_at(attr, 0x0C) & AF_COMPRESSED != 0 {
-            u16_at(attr, 0x22).min(16) as u8
+            // NTFS only writes 2^4-cluster units; larger values come from stale bytes and would only make
+            // `read_unit` allocate up to `bpc << 16` per unit.
+            u16_at(attr, 0x22).min(4) as u8
         } else {
             0
         },
@@ -403,7 +411,9 @@ impl ClusterMap {
 
     /// Number of free clusters in `lcn..lcn + len` (clusters past the bitmap count as used).
     pub(crate) fn free_in(&self, lcn: u64, len: u64) -> u64 {
-        let (mut i, end) = (lcn, lcn.saturating_add(len));
+        // Clusters past the bitmap count as used, so the walk can stop there (a garbage run length may be ~2^64).
+        let bitmap_end = (self.0.len() as u64).saturating_mul(8);
+        let (mut i, end) = (lcn, lcn.saturating_add(len).min(bitmap_end));
         let mut free = 0;
         while i < end {
             if i % 8 == 0 && i + 8 <= end {
@@ -668,6 +678,21 @@ pub struct Restored {
     pub read_errors: u64,
 }
 
+/// Whether `dest` (which may not exist yet, may be relative, `\\?\`-prefixed, UNC, a `subst` drive or reached
+/// through a junction) lies on the volume of `drive`. Compares volume serial numbers of the nearest existing
+/// ancestor; falls back to the drive letter of the absolute path when a serial cannot be read.
+fn same_volume(dest: &Path, drive: char) -> bool {
+    let abs = std::path::absolute(dest).unwrap_or_else(|_| dest.to_path_buf());
+    let existing = abs.ancestors().find(|a| a.exists());
+    let source = crate::winapi::volume_serial(Path::new(&format!("{drive}:\\")));
+    if let (Some(d), Some(s)) = (existing.and_then(crate::winapi::volume_serial), source) {
+        return d == s;
+    }
+    let s = abs.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    s.chars().next().is_some_and(|c| c.eq_ignore_ascii_case(&drive)) && s[1..].starts_with(':')
+}
+
 fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()
@@ -720,12 +745,7 @@ impl Volume {
         keep_dirs: bool,
         progress: &Progress,
     ) -> Result<Restored, ScanError> {
-        let dest_drive = dest
-            .to_string_lossy()
-            .chars()
-            .next()
-            .filter(|c| c.is_ascii_alphabetic());
-        if dest_drive.is_some_and(|c| c.eq_ignore_ascii_case(&self.drive)) {
+        if same_volume(dest, self.drive) {
             return Err(ScanError::Unsupported(
                 "восстанавливать нужно на другой диск: запись на тот же том может затереть удалённые данные".into(),
             ));
@@ -776,7 +796,7 @@ impl Volume {
             if pos >= f.size {
                 break;
             }
-            let span = (run.len * self.bpc).min(f.size - pos);
+            let span = run.len.saturating_mul(self.bpc).min(f.size - pos);
             let Some(lcn) = run.lcn else {
                 pos += span;
                 out.seek(SeekFrom::Start(pos))?; // sparse: a hole of zeros
@@ -792,7 +812,8 @@ impl Volume {
                 let want = (span - done).min(COPY_BUF);
                 let n = want.next_multiple_of(self.bpc) as usize;
                 let slice = &mut buf[..n];
-                if mft::read_exact_at(&self.file, slice, lcn * self.bpc + done).is_err() {
+                let at = lcn.checked_mul(self.bpc).and_then(|b| b.checked_add(done));
+                if at.is_none_or(|at| mft::read_exact_at(&self.file, slice, at).is_err()) {
                     errors += 1;
                     slice.fill(0);
                 }
@@ -873,9 +894,13 @@ impl Volume {
         }
         let Some(run) = f.runs.first() else { return Vec::new() };
         let Some(lcn) = run.lcn else { return vec![0u8; n] };
-        let clusters = (n as u64).div_ceil(self.bpc).clamp(1, run.len);
+        // `max` last: a zero-length run (legal in a run list) would make `clamp(1, 0)` panic.
+        let clusters = (n as u64).div_ceil(self.bpc).min(run.len).max(1);
+        let Some(at) = lcn.checked_mul(self.bpc) else {
+            return Vec::new();
+        };
         let mut buf = vec![0u8; (clusters * self.bpc) as usize];
-        if mft::read_exact_at(&self.file, &mut buf, lcn * self.bpc).is_err() {
+        if mft::read_exact_at(&self.file, &mut buf, at).is_err() {
             return Vec::new();
         }
         buf.truncate(n);
@@ -957,6 +982,92 @@ fn lznt1_decompress(src: &[u8], out: &mut Vec<u8>) {
 mod tests {
     use super::*;
     use crate::ntfs::testutil::*;
+
+    /// A garbage run length from a stale record must not make the scan count clusters past the bitmap for hours.
+    #[test]
+    fn free_in_stops_at_the_end_of_the_bitmap() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ClusterMap(vec![0; 8]).free_in(0, 1 << 50));
+        });
+        let free = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("free_in must not take forever");
+        assert_eq!(free, 64);
+        // clusters 5 and 7 of each byte are used: 3, 4, 6 and 8..=12 are free
+        assert_eq!(ClusterMap(vec![0b1010_0000; 2]).free_in(3, 10), 8);
+    }
+
+    /// Recovered data must never be written onto the volume it is read from, however the folder is spelled.
+    #[test]
+    fn restore_target_on_the_source_volume_is_detected_in_any_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path().to_str().unwrap().to_owned();
+        let drive = t.chars().next().unwrap();
+        assert!(same_volume(tmp.path(), drive));
+        assert!(same_volume(Path::new(&format!(r"{t}\not\yet\created")), drive));
+        assert!(
+            same_volume(Path::new(&format!(r"\\?\{t}\new")), drive),
+            "verbatim prefix"
+        );
+        let unc = format!(r"\\localhost\{}$\{}", drive, &t[3..]);
+        if Path::new(&unc).exists() {
+            assert!(
+                same_volume(Path::new(&unc), drive),
+                "administrative share of the same volume"
+            );
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_drive = cwd.to_str().unwrap().chars().next().unwrap();
+        assert!(
+            same_volume(Path::new("restored"), cwd_drive),
+            "relative path lands on the current drive"
+        );
+        // a folder reached through a junction lives on the junction target's volume
+        let link = cwd.join(format!("spacetree-junction-test-{}", std::process::id()));
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(tmp.path())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if made {
+            let r = same_volume(&link.join("sub"), drive);
+            let _ = std::fs::remove_dir(&link);
+            assert!(r, "junction to the source volume");
+        }
+    }
+
+    /// Free records are full of stale bytes: a huge starting VCN must mark the runs bad, not overflow.
+    #[test]
+    fn garbage_start_vcn_and_compression_unit_are_contained() {
+        let mut a = nonres(4096, &[0x11, 0x10, 0x05], AF_COMPRESSED);
+        a[0x10..0x18].copy_from_slice(&(u64::MAX - 4).to_le_bytes());
+        a[0x22..0x24].copy_from_slice(&15u16.to_le_bytes());
+        let d = data_attr(&a).unwrap();
+        assert!(d.bad_runs && d.runs.is_empty());
+        assert!(
+            d.unit <= 4,
+            "NTFS compression units are 2^4 clusters; larger ones only allocate garbage"
+        );
+    }
+
+    /// A run of zero clusters (allowed by the run-list format) made the preview panic on the GUI thread.
+    #[test]
+    fn preview_of_a_zero_length_run_does_not_panic() {
+        let img = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(img.path(), vec![0x5Au8; 4096]).unwrap();
+        let v = Volume {
+            drive: 'Z',
+            file: File::open(img.path()).unwrap(),
+            bpc: 512,
+        };
+        let mut f = DeletedFile::carved(1, 0, "bin", 512);
+        assert_eq!(f.runs[0].len, 0);
+        assert!(v.head(&f, 512).is_empty());
+        f.size = 100;
+        assert_eq!(v.head(&f, 512), vec![0x5A; 100]);
+    }
 
     fn nonres(real: u64, runs: &[u8], flags: u16) -> Vec<u8> {
         let mut a = nonresident_data(real, real, 0, flags, None);

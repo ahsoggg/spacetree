@@ -311,7 +311,8 @@ fn measure(src: &dyn Source, kind: Kind, lcn: u64, bound: u64) -> Option<(u64, &
         }
         Kind::Mp4 => {
             let (mut off, mut core) = (0u64, false);
-            while off + 16 <= bound {
+            // Saturating: a corrupt 64-bit box size must end the walk, not wrap the offset back to the start.
+            while off.saturating_add(16) <= bound {
                 let b = src.read_at(lcn, off, 16)?;
                 let mut size = u64::from(u32::from_be_bytes(b[..4].try_into().unwrap()));
                 let ty = &b[4..8];
@@ -328,7 +329,7 @@ fn measure(src: &dyn Source, kind: Kind, lcn: u64, bound: u64) -> Option<(u64, &
                 if size < 8 {
                     break;
                 }
-                off += size;
+                off = off.saturating_add(size);
             }
             (core).then(|| off.min(bound)).and_then(fit).map(|n| (n, "mp4"))
         }
@@ -504,6 +505,26 @@ mod tests {
         png.resize(32, 0);
         assert_eq!(signature(&png), Some(Kind::Png));
         assert_eq!(signature(&[0u8; 32]), None);
+    }
+
+    /// A 64-bit box size near u64::MAX made the offset wrap around to 0: the deep scan looped forever.
+    #[test]
+    fn mp4_box_size_overflow_terminates() {
+        let mut d = vec![0, 0, 0, 16];
+        d.extend(b"ftypisom");
+        d.extend([0u8; 4]);
+        d.extend([0, 0, 0, 1]);
+        d.extend(b"mdat");
+        d.extend(0xFFFF_FFFF_FFFF_FFF0u64.to_be_bytes());
+        let m = Mem(padded(d, 4096));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(measure(&m, Kind::Mp4, 0, 4096));
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("measure(Mp4) must not loop forever");
+        assert!(r.is_none_or(|(n, _)| n <= 4096));
     }
 
     #[test]
