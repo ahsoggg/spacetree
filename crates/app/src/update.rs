@@ -16,6 +16,8 @@ const EXE_ASSET: &str = "SpaceTree.exe";
 const SUM_ASSET: &str = "SpaceTree.exe.sha256";
 /// Do not ask GitHub more often than this (anonymous API limit is 60 requests per hour).
 pub const CHECK_INTERVAL_SECS: u64 = 6 * 3600;
+/// Download cap when GitHub does not announce the asset size.
+const MAX_EXE_BYTES: u64 = 256 << 20;
 
 #[derive(Clone, PartialEq)]
 pub enum State {
@@ -60,16 +62,25 @@ fn ua() -> String {
     format!("SpaceTree/{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// `"v1.2.3"` / `"1.2.3"` -> (1, 2, 3).
+/// `"v1.2.3"` / `"1.2.3"` -> (1, 2, 3). Missing minor/patch count as 0; any component that is present must be
+/// a number (`"1.x.3"` is rejected rather than read as 1.0.3).
 pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.trim().trim_start_matches(['v', 'V']);
     let core = s.split(['-', '+']).next()?;
-    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
+    let nums: Vec<u64> = core.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    if nums.len() > 3 {
+        return None;
+    }
     Some((
-        it.next()??,
-        it.next().flatten().unwrap_or(0),
-        it.next().flatten().unwrap_or(0),
+        nums[0],
+        nums.get(1).copied().unwrap_or(0),
+        nums.get(2).copied().unwrap_or(0),
     ))
+}
+
+/// Largest download accepted for an asset GitHub announced as `announced` bytes (0 = not announced).
+fn download_limit(announced: u64) -> u64 {
+    if announced > 0 { announced } else { MAX_EXE_BYTES }
 }
 
 pub fn is_newer(remote: &str, local: &str) -> bool {
@@ -158,10 +169,23 @@ fn download(rel: &Release, state: &Shared, repaint: &dyn Fn()) -> Result<(), Str
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut done = 0u64;
+    let limit = download_limit(rel.exe_size);
     loop {
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.to_string());
+            }
+        };
         if n == 0 {
             break;
+        }
+        if done + n as u64 > limit {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err("загрузка больше заявленного размера — обновление отменено".into());
         }
         hasher.update(&buf[..n]);
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
@@ -194,7 +218,15 @@ fn download(rel: &Release, state: &Shared, repaint: &dyn Fn()) -> Result<(), Str
 
 /// Checks for a newer release in the background; with `install`, downloads and installs it.
 pub fn spawn(state: Shared, install: bool, repaint: impl Fn() + Send + 'static) {
-    *state.lock().unwrap() = State::Checking;
+    {
+        let mut st = state.lock().unwrap();
+        // The new exe is already in place (the running one is `.exe.old`): another check would compare against
+        // the old version, download again and fail to replace the running image.
+        if matches!(*st, State::Ready { .. }) {
+            return;
+        }
+        *st = State::Checking;
+    }
     std::thread::spawn(move || {
         let result = (|| -> Result<State, String> {
             let rel = latest()?;
@@ -242,5 +274,29 @@ mod tests {
         assert!(is_newer("v0.10.0", "0.9.9"));
         assert!(!is_newer("0.2.0", "0.2.0"));
         assert!(!is_newer("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn malformed_versions_are_rejected() {
+        assert_eq!(parse_version("1.x.3"), None);
+        assert_eq!(parse_version("1..3"), None);
+        assert_eq!(parse_version("1.2.3.4"), None);
+        assert_eq!(parse_version("1"), Some((1, 0, 0)));
+        assert!(!is_newer("9.x", "0.3.1"));
+    }
+
+    #[test]
+    fn download_is_capped() {
+        assert_eq!(download_limit(5_000_000), 5_000_000);
+        assert_eq!(download_limit(0), MAX_EXE_BYTES);
+    }
+
+    #[test]
+    fn no_second_update_after_one_is_installed() {
+        let state: Shared = Arc::new(Mutex::new(State::Ready {
+            version: "9.9.9".into(),
+        }));
+        spawn(state.clone(), true, || {});
+        assert!(matches!(*state.lock().unwrap(), State::Ready { .. }));
     }
 }

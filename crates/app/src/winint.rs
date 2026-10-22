@@ -32,6 +32,49 @@ fn same_file(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
+/// Copies `src` over `dst`. An existing `dst` (possibly a running older copy, which cannot be overwritten but
+/// can be renamed) is moved to `.old` first and moved back if the copy fails, so a failed install never leaves
+/// the shortcuts pointing at a missing executable.
+fn replace_file(src: &Path, dst: &Path) -> Result<(), String> {
+    let old = dst.with_extension("exe.old");
+    let had_old = dst.exists();
+    if had_old {
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(dst, &old).map_err(|e| format!("{}: {e}", dst.display()))?;
+    }
+    if let Err(e) = std::fs::copy(src, dst) {
+        let _ = std::fs::remove_file(dst);
+        if had_old {
+            let _ = std::fs::rename(&old, dst);
+        }
+        return Err(format!("копирование в {}: {e}", dst.display()));
+    }
+    if had_old {
+        let _ = std::fs::remove_file(&old); // fails while the old copy is running; cleaned up on its next start
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use super::replace_file;
+
+    #[test]
+    fn failed_copy_keeps_the_installed_exe() {
+        let dir = std::env::temp_dir().join(format!("spacetree-install-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, dst) = (dir.join("new.exe"), dir.join("SpaceTree.exe"));
+        std::fs::write(&dst, b"installed").unwrap();
+        assert!(replace_file(&dir.join("missing.exe"), &dst).is_err());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"installed");
+        std::fs::write(&src, b"new").unwrap();
+        replace_file(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        assert!(!dst.with_extension("exe.old").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The running executable is the installed copy.
 pub fn running_installed() -> bool {
     match (std::env::current_exe(), installed_exe()) {
@@ -64,7 +107,7 @@ mod imp {
         SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, SHEmptyRecycleBinW, SHFILEOPSTRUCTW, SHFileOperationW,
     };
 
-    use super::{APP, InstallOptions, REPO_URL, install_dir, installed_exe, same_file};
+    use super::{APP, InstallOptions, REPO_URL, install_dir, installed_exe, replace_file, same_file};
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\SpaceTree";
@@ -274,13 +317,7 @@ mod imp {
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let cur = std::env::current_exe().map_err(|e| e.to_string())?;
         if !same_file(&cur, &exe) {
-            // A running older copy cannot be overwritten, but it can be renamed out of the way.
-            if exe.exists() && std::fs::remove_file(&exe).is_err() {
-                let old = exe.with_extension("exe.old");
-                let _ = std::fs::remove_file(&old);
-                std::fs::rename(&exe, &old).map_err(|e| format!("{}: {e}", exe.display()))?;
-            }
-            std::fs::copy(&cur, &exe).map_err(|e| format!("копирование в {}: {e}", exe.display()))?;
+            replace_file(&cur, &exe)?;
         }
 
         create_shortcuts(&exe, opts.desktop_shortcut)?;
