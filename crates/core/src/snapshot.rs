@@ -102,7 +102,9 @@ impl Snapshot {
         for l in lines {
             let l = l?;
             let (s, p) = l.split_once('\t').ok_or_else(|| bad("line"))?;
-            dirs.push((p.to_owned(), s.parse().map_err(|_| bad("size"))?));
+            // `diff` works in i64; no real folder comes near 2^63 bytes, so larger values mean a corrupt file.
+            let size: u64 = s.parse().ok().filter(|&v| v <= i64::MAX as u64).ok_or_else(|| bad("size"))?;
+            dirs.push((p.to_owned(), size));
         }
         dirs.sort_unstable();
         Ok(Snapshot {
@@ -131,11 +133,22 @@ fn series_dir(base: &Path, root: &str) -> PathBuf {
     base.join(if name.is_empty() { "_".into() } else { name })
 }
 
-/// Stored snapshots of `root`, oldest first.
+/// The `root` line of a stored snapshot (only the header is read).
+fn stored_root(path: &Path) -> Option<String> {
+    let mut lines = io::BufReader::new(std::fs::File::open(path).ok()?).lines();
+    if lines.next()?.ok()? != MAGIC {
+        return None;
+    }
+    lines.next()?.ok()?.strip_prefix("root\t").map(str::to_owned)
+}
+
+/// Stored snapshots of `root`, oldest first. Different roots can map to the same series folder
+/// (`E:\a b`, `E:\a_b`), so each file's recorded root is checked (case-insensitively, as Windows paths are).
 pub fn list(base: &Path, root: &str) -> Vec<Entry> {
     let Ok(rd) = std::fs::read_dir(series_dir(base, root)) else {
         return Vec::new();
     };
+    let want = root.to_lowercase();
     let mut v: Vec<Entry> = rd
         .filter_map(Result::ok)
         .filter_map(|e| {
@@ -143,6 +156,7 @@ pub fn list(base: &Path, root: &str) -> Vec<Entry> {
             let taken = p.file_stem()?.to_str()?.parse().ok()?;
             (p.extension()? == "tsv").then_some(Entry { taken, path: p })
         })
+        .filter(|e| stored_root(&e.path).is_some_and(|r| r.to_lowercase() == want))
         .collect();
     v.sort_by_key(|e| e.taken);
     v
@@ -289,6 +303,8 @@ mod tests {
         s.write(&mut buf).unwrap();
         assert_eq!(Snapshot::read(&buf[..]).unwrap(), s);
         assert!(Snapshot::read(&b"junk"[..]).is_err());
+        let huge = format!("{MAGIC}\nroot\tC:\\\ntaken\t1\ntotal\t1\n{}\ta\n", 1u64 << 63);
+        assert!(Snapshot::read(huge.as_bytes()).is_err(), "sizes beyond i64 would overflow diff");
     }
 
     #[test]
@@ -325,5 +341,24 @@ mod tests {
         assert_eq!(pick_baseline(&all, now, 1000 * day).unwrap().taken, all[0].taken);
         assert!(pick_baseline(&[], now, day).is_none());
         assert!(list(dir.path(), "D:\\").is_empty());
+    }
+
+    /// `E:\a b` and `E:\a_b` share a series folder name; their histories must not mix or delete each other.
+    #[test]
+    fn roots_with_the_same_series_folder_keep_separate_histories() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = snap(1_000_000, &[("", 1)]);
+        a.root = r"E:\a b".into();
+        let mut b = snap(1_000_060, &[("", 2)]);
+        b.root = r"E:\a_b".into();
+        save(dir.path(), &a).unwrap();
+        save(dir.path(), &b).unwrap();
+        let la = list(dir.path(), r"E:\a b");
+        let lb = list(dir.path(), r"E:\a_b");
+        assert_eq!(la.len(), 1, "saving E:\\a_b must not replace the snapshot of E:\\a b");
+        assert_eq!(lb.len(), 1);
+        assert_eq!(load(&la[0]).unwrap().root, r"E:\a b");
+        assert_eq!(load(&lb[0]).unwrap().root, r"E:\a_b");
+        assert_eq!(list(dir.path(), r"e:\A B").len(), 1, "same folder, other letter case");
     }
 }
