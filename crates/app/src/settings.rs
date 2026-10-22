@@ -63,11 +63,18 @@ fn file() -> Option<PathBuf> {
 impl Settings {
     pub fn load() -> Settings {
         let Some(f) = file() else { return Settings::default() };
-        let bytes = std::fs::read(&f).ok();
-        let (settings, corrupt) = Self::parse(bytes.as_deref());
-        if corrupt && !is_demo() {
-            // Keep the damaged file for inspection; the next save writes a fresh one.
-            let _ = std::fs::rename(&f, f.with_extension("json.bad"));
+        let (settings, damaged) = match std::fs::read(&f) {
+            Ok(b) => Self::parse(Some(&b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::parse(None),
+            // Present but unreadable (locked by an antivirus, ...): same caution as a damaged file, but leave it.
+            Err(_) => (Self::parse(Some(b"")).0, false),
+        };
+        if damaged && !is_demo() {
+            // Keep the damaged file for inspection and write the cautious settings at once: otherwise a run that
+            // ends without saving would leave no file, and the next start would fall back to auto-update on.
+            if std::fs::rename(&f, f.with_extension("json.bad")).is_ok() {
+                settings.save();
+            }
         }
         settings
     }

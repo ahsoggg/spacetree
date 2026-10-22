@@ -230,7 +230,12 @@ impl App {
             Vec::new()
         };
         // The bins shown in the dialog are on the scanned volume; only that drive's bin is emptied.
-        let bin_drive = p.ids.first().and_then(|&b| tree.path(b).chars().next()).unwrap_or('C');
+        let bin_drive = p.ids.first().and_then(|&b| bin_drive_of(&tree.path(b)));
+        if p.empty_bin && bin_drive.is_none() {
+            self.toast("Не удалось определить диск корзины", ToastKind::Error);
+            return;
+        }
+        let bin_drive = bin_drive.unwrap_or('C');
         let bin_children: Vec<NodeId> = if p.empty_bin {
             p.ids.iter().flat_map(|&b| tree.children(b).to_vec()).collect()
         } else {
@@ -516,6 +521,14 @@ impl App {
     }
 }
 
+/// Drive letter of a `$Recycle.Bin` folder path (`C:\$Recycle.Bin`, `\\?\C:\$Recycle.Bin`).
+fn bin_drive_of(path: &str) -> Option<char> {
+    let p = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let mut it = p.chars();
+    let d = it.next().filter(char::is_ascii_alphabetic)?;
+    (it.next() == Some(':')).then_some(d.to_ascii_uppercase())
+}
+
 /// The recycle bin (SHFileOperation) only takes Win32 paths, whose normalisation strips trailing dots and spaces
 /// from names: for such a name it would act on a different file.
 fn recycle_safe(path: &str) -> bool {
@@ -591,6 +604,13 @@ mod tests {
         assert!(verbatim(r"d\keep").exists());
         assert!(std::fs::symlink_metadata(verbatim("d ")).is_err());
         let _ = std::fs::remove_dir_all(format!(r"\\?\{base}"));
+    }
+
+    #[test]
+    fn bin_drive_is_taken_from_the_volume_not_the_first_character() {
+        assert_eq!(bin_drive_of(r"C:\$Recycle.Bin"), Some('C'));
+        assert_eq!(bin_drive_of(r"\\?\d:\$Recycle.Bin"), Some('D'));
+        assert_eq!(bin_drive_of(r"\\server\share\$Recycle.Bin"), None);
     }
 
     #[test]

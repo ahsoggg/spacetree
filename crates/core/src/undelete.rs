@@ -894,8 +894,11 @@ impl Volume {
         }
         let Some(run) = f.runs.first() else { return Vec::new() };
         let Some(lcn) = run.lcn else { return vec![0u8; n] };
-        // `max` last: a zero-length run (legal in a run list) would make `clamp(1, 0)` panic.
-        let clusters = (n as u64).div_ceil(self.bpc).min(run.len).max(1);
+        // A zero-length run (legal in a run list) has no data; reading its LCN would show someone else's cluster.
+        if run.len == 0 {
+            return Vec::new();
+        }
+        let clusters = (n as u64).div_ceil(self.bpc).clamp(1, run.len);
         let Some(at) = lcn.checked_mul(self.bpc) else {
             return Vec::new();
         };
@@ -1066,6 +1069,11 @@ mod tests {
         assert_eq!(f.runs[0].len, 0);
         assert!(v.head(&f, 512).is_empty());
         f.size = 100;
+        assert!(
+            v.head(&f, 512).is_empty(),
+            "no data in a zero-length run, not the cluster at its LCN"
+        );
+        let f = DeletedFile::carved(1, 100, "bin", 512);
         assert_eq!(v.head(&f, 512), vec![0x5A; 100]);
     }
 
