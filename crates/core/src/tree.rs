@@ -540,7 +540,11 @@ mod tests {
             let root = b.add(NO_PARENT, "r", Kind::Dir, 0, 0);
             let (d, x, y) = if topological {
                 let d = b.add(root, "d", Kind::Dir, 0, 0);
-                (d, b.add(d, "x", Kind::File, half, half), b.add(d, "y", Kind::File, half, half))
+                (
+                    d,
+                    b.add(d, "x", Kind::File, half, half),
+                    b.add(d, "y", Kind::File, half, half),
+                )
             } else {
                 let x = b.add(3, "x", Kind::File, half, half);
                 let y = b.add(3, "y", Kind::File, half, half);

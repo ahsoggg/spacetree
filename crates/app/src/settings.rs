@@ -75,7 +75,9 @@ impl Settings {
     /// Settings from the file contents (`None` = no file); the flag is set when the file could not be parsed.
     /// A damaged file must not silently switch auto-update back on for a user who turned it off.
     fn parse(bytes: Option<&[u8]>) -> (Settings, bool) {
-        let Some(b) = bytes else { return (Settings::default(), false) };
+        let Some(b) = bytes else {
+            return (Settings::default(), false);
+        };
         match serde_json::from_slice(b) {
             Ok(s) => (s, false),
             Err(_) => (

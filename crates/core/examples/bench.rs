@@ -26,7 +26,10 @@ struct Lcg(u64);
 
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 33
     }
 }
@@ -47,11 +50,18 @@ fn generate(root: &Path, dirs: usize, files: usize) {
     let mut total = 0u64;
     for i in 0..files {
         let dir = &paths[(rng.next() as usize) % paths.len()];
-        let len = if rng.next() % 10 < 7 { 0 } else { (rng.next() % 1500 + 1) as usize };
+        let len = if rng.next() % 10 < 7 {
+            0
+        } else {
+            (rng.next() % 1500 + 1) as usize
+        };
         total += len as u64;
         std::fs::write(dir.join(format!("f{i:06}.bin")), vec![b'a'; len]).unwrap();
     }
-    println!("generated {dirs} dirs, {files} files, {total} bytes under {}", root.display());
+    println!(
+        "generated {dirs} dirs, {files} files, {total} bytes under {}",
+        root.display()
+    );
 }
 
 fn report(name: &str, mut times: Vec<Duration>) {
@@ -120,7 +130,9 @@ fn mft(records: usize, runs: usize) {
                 all_dirs[(rng.next() as usize) % all_dirs.len()]
             };
             let mut si = vec![0u8; 0x30];
-            si[8..16].copy_from_slice(&((1_700_000_000u64 + rng.next() % 10_000_000 + 11_644_473_600) * 10_000_000).to_le_bytes());
+            si[8..16].copy_from_slice(
+                &((1_700_000_000u64 + rng.next() % 10_000_000 + 11_644_473_600) * 10_000_000).to_le_bytes(),
+            );
             if roll < 5 {
                 testutil::record(0x00, 0, &[testutil::file_name_attr(parent, "deleted", 1)])
             } else if roll < 15 {
@@ -128,7 +140,10 @@ fn mft(records: usize, runs: usize) {
                 testutil::record(
                     0x03,
                     0,
-                    &[testutil::resident(0x10, &si), testutil::file_name_attr(parent, &format!("dir{i}"), 1)],
+                    &[
+                        testutil::resident(0x10, &si),
+                        testutil::file_name_attr(parent, &format!("dir{i}"), 1),
+                    ],
                 )
             } else {
                 let name = format!("file name {i} with some length.dat");
@@ -138,7 +153,13 @@ fn mft(records: usize, runs: usize) {
                 }
                 attrs.push(testutil::file_name_attr(parent, &name, 1));
                 if roll < 60 {
-                    attrs.push(testutil::nonresident_data(rng.next() % 10_000_000, 4096 * (rng.next() % 2500), 0, 0, None));
+                    attrs.push(testutil::nonresident_data(
+                        rng.next() % 10_000_000,
+                        4096 * (rng.next() % 2500),
+                        0,
+                        0,
+                        None,
+                    ));
                 } else {
                     attrs.push(testutil::resident(0x80, &[1u8; 100]));
                 }

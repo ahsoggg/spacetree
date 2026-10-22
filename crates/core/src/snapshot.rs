@@ -103,7 +103,11 @@ impl Snapshot {
             let l = l?;
             let (s, p) = l.split_once('\t').ok_or_else(|| bad("line"))?;
             // `diff` works in i64; no real folder comes near 2^63 bytes, so larger values mean a corrupt file.
-            let size: u64 = s.parse().ok().filter(|&v| v <= i64::MAX as u64).ok_or_else(|| bad("size"))?;
+            let size: u64 = s
+                .parse()
+                .ok()
+                .filter(|&v| v <= i64::MAX as u64)
+                .ok_or_else(|| bad("size"))?;
             dirs.push((p.to_owned(), size));
         }
         dirs.sort_unstable();
@@ -304,7 +308,10 @@ mod tests {
         assert_eq!(Snapshot::read(&buf[..]).unwrap(), s);
         assert!(Snapshot::read(&b"junk"[..]).is_err());
         let huge = format!("{MAGIC}\nroot\tC:\\\ntaken\t1\ntotal\t1\n{}\ta\n", 1u64 << 63);
-        assert!(Snapshot::read(huge.as_bytes()).is_err(), "sizes beyond i64 would overflow diff");
+        assert!(
+            Snapshot::read(huge.as_bytes()).is_err(),
+            "sizes beyond i64 would overflow diff"
+        );
     }
 
     #[test]
