@@ -73,6 +73,15 @@ impl Tree {
     pub fn from_parts(mut nodes: Vec<Node>, names: String) -> Tree {
         assert!(!nodes.is_empty(), "tree needs a root");
         nodes[0].parent = NO_PARENT;
+        if Self::is_topological(&nodes) {
+            Self::from_topological(nodes, names)
+        } else {
+            Self::from_any_order(nodes, names)
+        }
+    }
+
+    /// General path: breadth-first order from the root; unreachable nodes are re-attached to the root.
+    fn from_any_order(mut nodes: Vec<Node>, names: String) -> Tree {
         let n = nodes.len();
         let (mut child_start, mut children, mut order) = Self::index(&nodes);
         if order.len() < n {
@@ -89,6 +98,37 @@ impl Tree {
             debug_assert_eq!(order.len(), n);
         }
 
+        let dir_count = Self::reset_totals(&mut nodes);
+        for &id in order.iter().rev() {
+            Self::add_to_parent(&mut nodes, id as usize);
+        }
+        Self::finish(nodes, names, child_start, children, dir_count)
+    }
+
+    /// Every node's parent precedes it (`parent < id`), as the directory walker numbers them: then every node
+    /// is reachable from the root, there are no cycles, and descending ids are a valid bottom-up order.
+    fn is_topological(nodes: &[Node]) -> bool {
+        nodes
+            .par_iter()
+            .enumerate()
+            .skip(1)
+            .with_min_len(64 * 1024)
+            .all(|(i, nd)| (nd.parent as usize) < i)
+    }
+
+    /// Same result as the general path without the breadth-first order: one descending sweep over the node
+    /// array aggregates bottom-up and reads memory sequentially.
+    fn from_topological(mut nodes: Vec<Node>, names: String) -> Tree {
+        let (child_start, children) = Self::child_index(&nodes);
+        let dir_count = Self::reset_totals(&mut nodes);
+        for id in (1..nodes.len()).rev() {
+            Self::add_to_parent(&mut nodes, id);
+        }
+        Self::finish(nodes, names, child_start, children, dir_count)
+    }
+
+    /// Clears directory/link totals before aggregation; returns the number of directories.
+    fn reset_totals(nodes: &mut [Node]) -> u32 {
         let mut dir_count = 0u32;
         for nd in nodes.iter_mut() {
             match nd.kind {
@@ -106,19 +146,23 @@ impl Tree {
                 }
             }
         }
-        for &id in order.iter().rev() {
-            let nd = nodes[id as usize];
-            if nd.parent != NO_PARENT {
-                let p = &mut nodes[nd.parent as usize];
-                p.size += nd.size;
-                p.alloc += nd.alloc;
-                p.files += nd.files;
-                if nd.kind != Kind::Link {
-                    p.mtime = p.mtime.max(nd.mtime);
-                }
+        dir_count
+    }
+
+    fn add_to_parent(nodes: &mut [Node], id: usize) {
+        let nd = nodes[id];
+        if nd.parent != NO_PARENT {
+            let p = &mut nodes[nd.parent as usize];
+            p.size += nd.size;
+            p.alloc += nd.alloc;
+            p.files += nd.files;
+            if nd.kind != Kind::Link {
+                p.mtime = p.mtime.max(nd.mtime);
             }
         }
+    }
 
+    fn finish(nodes: Vec<Node>, names: String, child_start: Vec<u32>, mut children: Vec<u32>, dir_count: u32) -> Tree {
         Self::sort_children(&nodes, &child_start, &mut children);
         let child_len = child_start.windows(2).map(|w| w[1] - w[0]).collect();
         Tree {
@@ -132,6 +176,22 @@ impl Tree {
     }
 
     fn index(nodes: &[Node]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let n = nodes.len();
+        let (child_start, children) = Self::child_index(nodes);
+        let mut order = Vec::with_capacity(n);
+        order.push(ROOT);
+        let mut head = 0;
+        while head < order.len() {
+            let id = order[head] as usize;
+            head += 1;
+            let (s, e) = (child_start[id] as usize, child_start[id + 1] as usize);
+            order.extend_from_slice(&children[s..e]);
+        }
+        (child_start, children, order)
+    }
+
+    /// CSR index: the children of `i` are `children[child_start[i]..child_start[i + 1]]`, ascending ids.
+    fn child_index(nodes: &[Node]) -> (Vec<u32>, Vec<u32>) {
         let n = nodes.len();
         let mut child_start = vec![0u32; n + 1];
         for (i, nd) in nodes.iter().enumerate() {
@@ -151,16 +211,7 @@ impl Tree {
                 *c += 1;
             }
         }
-        let mut order = Vec::with_capacity(n);
-        order.push(ROOT);
-        let mut head = 0;
-        while head < order.len() {
-            let id = order[head] as usize;
-            head += 1;
-            let (s, e) = (child_start[id] as usize, child_start[id + 1] as usize);
-            order.extend_from_slice(&children[s..e]);
-        }
-        (child_start, children, order)
+        (child_start, children)
     }
 
     fn sort_children(nodes: &[Node], child_start: &[u32], children: &mut [u32]) {
@@ -397,6 +448,84 @@ mod tests {
         assert_eq!(t.dir_count(), 3);
         assert!(!t.remove(inner), "already removed");
         assert!(!t.remove(root), "the root cannot be removed");
+    }
+
+    /// Random tree in walker order (`parent < id`): dirs, files and links, sizes with many ties.
+    fn random_nodes(seed: u64, n: usize) -> (Vec<Node>, String) {
+        let mut s = seed;
+        let mut rnd = move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s >> 33
+        };
+        let mut b = Builder::default();
+        b.add(NO_PARENT, "r", Kind::Dir, 0, 0);
+        let mut dirs = vec![0u32];
+        for i in 1..n {
+            let parent = dirs[rnd() as usize % dirs.len()];
+            let kind = match rnd() % 10 {
+                0..=2 => Kind::Dir,
+                3 => Kind::Link,
+                _ => Kind::File,
+            };
+            let id = b.add(parent, &format!("n{i}"), kind, rnd() % 50, rnd() % 50 * 4096);
+            b.nodes[id as usize].mtime = (rnd() % 1000) as u32;
+            if kind == Kind::Dir {
+                dirs.push(id);
+            }
+        }
+        (b.nodes, b.names)
+    }
+
+    fn assert_same(a: &Tree, b: &Tree) {
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.dir_count(), b.dir_count());
+        for id in 0..a.len() as NodeId {
+            let (x, y) = (a.node(id), b.node(id));
+            assert_eq!(
+                (x.parent, x.size, x.alloc, x.files, x.mtime, x.kind),
+                (y.parent, y.size, y.alloc, y.files, y.mtime, y.kind),
+                "node {id}"
+            );
+            assert_eq!(a.children(id), b.children(id), "children of {id}");
+            assert_eq!(a.name(id), b.name(id));
+        }
+    }
+
+    #[test]
+    fn differential_topological_fast_path_matches_general_path() {
+        for (seed, n) in [(1, 2), (2, 50), (3, 5_000), (4, 70_000)] {
+            let (nodes, names) = random_nodes(seed, n);
+            assert!(Tree::is_topological(&nodes));
+            let fast = Tree::from_parts(nodes.clone(), names.clone());
+            let general = Tree::from_any_order(nodes, names);
+            assert_same(&fast, &general);
+        }
+    }
+
+    #[test]
+    fn differential_shuffled_ids_give_the_same_tree() {
+        let (nodes, names) = random_nodes(9, 20_000);
+        let reference = Tree::from_parts(nodes.clone(), names.clone());
+        // Reverse ids 1.. (the root stays 0): almost every parent now follows its child.
+        let n = nodes.len() as u32;
+        let map = |id: u32| if id == 0 || id == NO_PARENT { id } else { n - id };
+        let mut shuffled = nodes.clone();
+        for (i, nd) in nodes.iter().enumerate() {
+            let mut m = *nd;
+            m.parent = map(nd.parent);
+            shuffled[map(i as u32) as usize] = m;
+        }
+        assert!(!Tree::is_topological(&shuffled));
+        let t = Tree::from_parts(shuffled, names);
+        for id in 0..n {
+            let (x, y) = (reference.node(id), t.node(map(id)));
+            assert_eq!((x.size, x.alloc, x.files, x.mtime), (y.size, y.alloc, y.files, y.mtime));
+            let mut a: Vec<u32> = reference.children(id).iter().map(|&c| map(c)).collect();
+            let mut b = t.children(map(id)).to_vec();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b);
+        }
     }
 
     #[test]

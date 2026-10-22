@@ -10,6 +10,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::time::Instant;
 
+use rayon::prelude::*;
+
 use crate::error::ScanError;
 use crate::progress::{PHASE_BUILDING, Progress};
 use crate::scan::Timings;
@@ -17,9 +19,12 @@ use crate::tree::{Kind, NO_PARENT, Node, Tree};
 
 const MAX_ERROR_SAMPLES: usize = 200;
 
+/// Per-thread output. Each listed directory appends one block of nodes whose ids are consecutive.
 #[derive(Default)]
 struct Sink {
-    nodes: Vec<(u32, Node)>,
+    nodes: Vec<Node>,
+    /// `(first id, index of the block's first node in nodes)`.
+    blocks: Vec<(u32, u32)>,
     names: String,
 }
 
@@ -77,6 +82,13 @@ impl Listing {
     }
 }
 
+struct Block {
+    first: u32,
+    sink: u32,
+    start: u32,
+    name_base: u32,
+}
+
 pub struct WalkOutput {
     pub tree: Tree,
     pub errors: u64,
@@ -132,20 +144,37 @@ pub fn scan(root: &Path, progress: &Progress) -> Result<WalkOutput, ScanError> {
     progress.phase.store(PHASE_BUILDING, Relaxed);
     let t_build = Instant::now();
     let total = ctx.next_id.load(Relaxed) as usize;
-    let placeholder = Node::new(NO_PARENT, 0, 0, Kind::File, 0, 0);
     let root_name = root.to_string_lossy().into_owned();
-    let mut names = root_name.clone();
-    let mut nodes = vec![placeholder; total];
-    nodes[0] = Node::new(NO_PARENT, 0, root_name.len() as u16, Kind::Dir, 0, 0);
-    for sink in ctx.sinks {
-        let sink = sink.into_inner().unwrap();
-        let base = names.len() as u32;
+    let sinks: Vec<Sink> = ctx.sinks.into_iter().map(|s| s.into_inner().unwrap()).collect();
+    let mut names = String::with_capacity(root_name.len() + sinks.iter().map(|s| s.names.len()).sum::<usize>());
+    names.push_str(&root_name);
+    // Blocks tile the ids 1..total; sorted by first id, the block holding an id is found by binary search.
+    let mut blocks: Vec<Block> = Vec::with_capacity(sinks.iter().map(|s| s.blocks.len()).sum());
+    for (si, sink) in sinks.iter().enumerate() {
+        let name_base = names.len() as u32;
         names.push_str(&sink.names);
-        for (id, mut n) in sink.nodes {
-            n.name_off += base;
-            nodes[id as usize] = n;
-        }
+        blocks.extend(sink.blocks.iter().map(|&(first, start)| Block {
+            first,
+            sink: si as u32,
+            start,
+            name_base,
+        }));
     }
+    blocks.par_sort_unstable_by_key(|b| b.first);
+    let root_node = Node::new(NO_PARENT, 0, root_name.len() as u16, Kind::Dir, 0, 0);
+    let nodes: Vec<Node> = (0..total as u32)
+        .into_par_iter()
+        .with_min_len(4096)
+        .map(|id| {
+            if id == 0 {
+                return root_node;
+            }
+            let b = &blocks[blocks.partition_point(|b| b.first <= id) - 1];
+            let mut n = sinks[b.sink as usize].nodes[(b.start + (id - b.first)) as usize];
+            n.name_off += b.name_base;
+            n
+        })
+        .collect();
     let errors = progress.errors.load(Relaxed);
     let error_samples = ctx.errors.into_inner().unwrap();
     Ok(WalkOutput {
@@ -176,10 +205,12 @@ fn scan_dir<'s>(ctx: &'s Ctx<'s>, scope: &rayon::Scope<'s>, path: plat::DirPath,
         let mut sink = ctx.sinks[idx.min(ctx.sinks.len() - 1)].lock().unwrap();
         let base = sink.names.len() as u32;
         sink.names.push_str(&list.names);
-        for (i, e) in list.entries.iter().enumerate() {
+        let start = sink.nodes.len() as u32;
+        sink.blocks.push((first, start));
+        for e in &list.entries {
             let mut node = Node::new(id, base + e.name_off, e.name_len, e.kind, e.size, e.alloc);
             node.mtime = e.mtime;
-            sink.nodes.push((first + i as u32, node));
+            sink.nodes.push(node);
             if e.kind == Kind::File {
                 files += 1;
                 bytes += e.size;

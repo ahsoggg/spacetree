@@ -187,6 +187,89 @@ fn unreadable_directory_is_counted_not_fatal() {
     check_invariants(&out.tree);
 }
 
+/// Independent reference walker on `std::fs`: path -> (kind, size, files) for every node below `dir`.
+fn reference(dir: &Path, out: &mut std::collections::BTreeMap<String, (Kind, u64, u32)>) -> (u64, u32) {
+    let (mut size, mut files) = (0u64, 0u32);
+    for e in fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        let meta = fs::symlink_metadata(&p).unwrap();
+        let key = p.to_string_lossy().into_owned();
+        let v = if meta.file_type().is_symlink() || (meta.is_dir() && is_reparse(&meta)) {
+            (Kind::Link, 0, 0)
+        } else if meta.is_dir() {
+            let (s, f) = reference(&p, out);
+            (Kind::Dir, s, f)
+        } else {
+            (Kind::File, meta.len(), 1)
+        };
+        size += v.1;
+        files += v.2;
+        out.insert(key, v);
+    }
+    (size, files)
+}
+
+#[cfg(windows)]
+fn is_reparse(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse(_: &fs::Metadata) -> bool {
+    false
+}
+
+/// Deterministic tree with many folders (so the walk spreads over all threads), empty folders and files.
+fn build_random_tree(root: &Path, dirs: usize, files: usize) {
+    let mut s = 12345u64;
+    let mut rnd = move || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (s >> 33) as usize
+    };
+    fs::create_dir_all(root).unwrap();
+    let mut all = vec![root.to_path_buf()];
+    for i in 0..dirs {
+        let p = all[rnd() % all.len()].join(format!("d{i}"));
+        fs::create_dir(&p).unwrap();
+        all.push(p);
+    }
+    for i in 0..files {
+        let p = all[rnd() % all.len()].join(format!("f{i}.bin"));
+        fs::write(p, vec![b'z'; rnd() % 3000]).unwrap();
+    }
+}
+
+#[test]
+fn differential_walk_matches_reference_walker() {
+    let dir = tempfile::tempdir().unwrap();
+    build_fixture(dir.path());
+    build_random_tree(&dir.path().join("rand"), 400, 3000);
+    let link: PathBuf = dir.path().join("rand/d1/link_to_root").components().collect();
+    let linked = try_symlink_dir(dir.path(), &link);
+
+    let mut want = std::collections::BTreeMap::new();
+    let (size, files) = reference(dir.path(), &mut want);
+    for _ in 0..3 {
+        let out = scan_walk(dir.path());
+        let t = &out.tree;
+        assert_eq!(t.root_stats().0, size);
+        assert_eq!(t.root_stats().2, files);
+        let got: std::collections::BTreeMap<String, (Kind, u64, u32)> = (1..t.len() as NodeId)
+            .map(|id| {
+                let n = t.node(id);
+                (t.path(id), (n.kind, n.size, n.files))
+            })
+            .collect();
+        assert_eq!(got.len(), t.len() - 1, "duplicate paths in the tree");
+        assert_eq!(got, want);
+        check_invariants(t);
+    }
+    if linked {
+        let _ = fs::remove_dir(&link);
+    }
+}
+
 #[test]
 fn nonexistent_root_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
