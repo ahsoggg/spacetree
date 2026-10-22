@@ -475,9 +475,10 @@ pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanE
     })
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub mod testutil {
-    //! Builder for synthetic FILE records (1024 bytes, 2 sectors, fixups applied).
+    //! Builder for synthetic FILE records (1024 bytes, 2 sectors, fixups applied); public only for the
+    //! benchmark example and tests.
 
     pub fn utf16(s: &str) -> Vec<u8> {
         s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
