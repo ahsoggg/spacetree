@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Align2, Color32, RichText, Ui, vec2};
@@ -285,7 +285,12 @@ impl App {
                         Err(e) => self.recover.note = e.to_string(),
                     }
                 }
-                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                // The worker died (panic): without this the window would stay busy forever.
+                Err(TryRecvError::Disconnected) => {
+                    self.recover.scan = None;
+                    self.recover.note = "Рабочий поток завершился аварийно (подробности в журнале)".into();
+                }
             }
         }
         if let Some(job) = &self.recover.deep {
@@ -307,7 +312,12 @@ impl App {
                         Err(e) => self.recover.note = e.to_string(),
                     }
                 }
-                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                // The worker died (panic): without this the window would stay busy forever.
+                Err(TryRecvError::Disconnected) => {
+                    self.recover.deep = None;
+                    self.recover.note = "Рабочий поток завершился аварийно (подробности в журнале)".into();
+                }
             }
         }
         if let Some(job) = &self.recover.restore {
@@ -333,7 +343,12 @@ impl App {
                     self.toast(msg.clone(), kind);
                     self.recover.note = format!("{msg}  →  {}", dest.display());
                 }
-                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                // The worker died (panic): without this the window would stay busy forever.
+                Err(TryRecvError::Disconnected) => {
+                    self.recover.restore = None;
+                    self.recover.note = "Рабочий поток завершился аварийно (подробности в журнале)".into();
+                }
             }
         }
     }
