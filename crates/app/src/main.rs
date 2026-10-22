@@ -215,6 +215,9 @@ pub struct App {
     pub data: Option<Arc<Loaded>>,
     /// Bumped whenever the tree changes after a scan.
     pub generation: u64,
+    /// Bumped whenever a new tree is installed; deletions remember it so that node ids of one tree are never
+    /// applied to another.
+    pub scans: u64,
     pub message: String,
     pub status: Arc<Mutex<Option<(String, ToastKind)>>>,
     pub tab: Tab,
@@ -376,6 +379,7 @@ impl App {
             job: None,
             data: None,
             generation: 0,
+            scans: 0,
             message: String::new(),
             status: Arc::default(),
             tab: Tab::Overview,
@@ -504,6 +508,10 @@ impl App {
         if self.job.is_some() {
             return;
         }
+        if !self.delete.idle() {
+            self.toast("Сначала дождитесь окончания удаления", ToastKind::Info);
+            return;
+        }
         if settings::is_demo() {
             self.load_demo();
             return;
@@ -611,6 +619,8 @@ impl App {
         self.dup_pending = None;
         self.data = Some(Arc::new(loaded));
         self.generation += 1;
+        self.scans += 1;
+        self.delete.tree_replaced();
         self.selected = None;
         self.tm_root = ROOT;
         self.tm = None;

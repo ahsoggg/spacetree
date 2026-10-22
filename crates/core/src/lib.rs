@@ -38,3 +38,36 @@ pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
         None
     }
 }
+
+/// The path to hand to file-system calls for a path built by [`Tree::path`]. On Windows an absolute path gets
+/// the `\\?\` prefix: Win32 normalisation would otherwise strip trailing dots and spaces from every component
+/// (`data.` -> `data`), so a call meant for one file would hit its neighbour. Tree names never are `.` or `..`.
+pub fn fs_path(path: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+            return path.into();
+        }
+        if let Some(unc) = path.strip_prefix(r"\\") {
+            return format!(r"\\?\UNC\{}", unc.replace('/', "\\")).into();
+        }
+        let b = path.as_bytes();
+        if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/') {
+            return format!(r"\\?\{}", path.replace('/', "\\")).into();
+        }
+    }
+    path.into()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn fs_path_makes_absolute_paths_verbatim() {
+        let s = |p: &str| super::fs_path(p).to_string_lossy().into_owned();
+        assert_eq!(s(r"C:\a\b."), r"\\?\C:\a\b.");
+        assert_eq!(s("D:/x/y "), r"\\?\D:\x\y ");
+        assert_eq!(s(r"\\srv\share\f."), r"\\?\UNC\srv\share\f.");
+        assert_eq!(s(r"\\?\C:\a"), r"\\?\C:\a");
+        assert_eq!(s("relative"), "relative");
+    }
+}

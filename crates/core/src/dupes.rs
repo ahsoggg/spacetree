@@ -110,7 +110,7 @@ fn feed(f: &mut File, offset: u64, len: u64, hasher: &mut blake3::Hasher, progre
 
 /// Hashes the requested part of a file; `None` if the file cannot be read, is not `size` bytes long any more,
 /// is a cloud placeholder, or the search was cancelled.
-fn hash_file(path: &str, size: u64, part: Part, progress: &DupProgress) -> Option<blake3::Hash> {
+fn hash_file(path: &Path, size: u64, part: Part, progress: &DupProgress) -> Option<blake3::Hash> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() != size || is_cloud_only(&meta) {
         return None;
@@ -188,7 +188,7 @@ fn refine(
             .par_iter()
             .flat_map_iter(|(size, ids)| ids.iter().map(move |&id| (*size, id)))
             .filter_map(|(size, id)| {
-                let h = hash_file(&tree.path(id), size, part, progress);
+                let h = hash_file(&crate::fs_path(&tree.path(id)), size, part, progress);
                 progress.done.fetch_add(1, Relaxed);
                 h.map(|h| (size, *h.as_bytes(), id))
             })
@@ -288,6 +288,26 @@ mod tests {
         std::fs::write(&keep, b"changed").unwrap();
         assert_eq!(std::fs::read(&dup).unwrap(), b"changed", "dup now shares the data of keep");
         assert!(!dir.path().join("d.spacetree-link").exists());
+    }
+
+    /// `a.` must be hashed as itself: through a Win32 path it would read its neighbour `a`, and a unique file
+    /// would be offered for deletion as a "duplicate".
+    #[cfg(windows)]
+    #[test]
+    fn trailing_dot_name_is_read_as_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let verbatim = |n: &str| PathBuf::from(format!(r"\\?\{root}\{n}"));
+        std::fs::write(verbatim("a"), b"same same same").unwrap();
+        std::fs::write(verbatim("a."), b"unique content").unwrap();
+        std::fs::write(verbatim("b"), b"same same same").unwrap();
+        let mut b = Builder::default();
+        let r = b.add(NO_PARENT, root, Kind::Dir, 0, 0);
+        let ids: Vec<NodeId> = ["a.", "b"].iter().map(|n| b.add(r, n, Kind::File, 14, 0)).collect();
+        let tree = b.finish();
+        let sets = find(&tree, &ids, &DupProgress::default()).unwrap();
+        assert!(sets.is_empty(), "a. and b differ");
+        let _ = std::fs::remove_file(verbatim("a."));
     }
 
     #[test]

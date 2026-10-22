@@ -62,10 +62,30 @@ fn file() -> Option<PathBuf> {
 
 impl Settings {
     pub fn load() -> Settings {
-        file()
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        let Some(f) = file() else { return Settings::default() };
+        let bytes = std::fs::read(&f).ok();
+        let (settings, corrupt) = Self::parse(bytes.as_deref());
+        if corrupt && !is_demo() {
+            // Keep the damaged file for inspection; the next save writes a fresh one.
+            let _ = std::fs::rename(&f, f.with_extension("json.bad"));
+        }
+        settings
+    }
+
+    /// Settings from the file contents (`None` = no file); the flag is set when the file could not be parsed.
+    /// A damaged file must not silently switch auto-update back on for a user who turned it off.
+    fn parse(bytes: Option<&[u8]>) -> (Settings, bool) {
+        let Some(b) = bytes else { return (Settings::default(), false) };
+        match serde_json::from_slice(b) {
+            Ok(s) => (s, false),
+            Err(_) => (
+                Settings {
+                    auto_update: false,
+                    ..Settings::default()
+                },
+                true,
+            ),
+        }
     }
 
     /// Best effort: settings are a convenience, failing to save them is not worth an error dialog.
@@ -86,5 +106,28 @@ impl Settings {
         self.recent.retain(|p| !p.eq_ignore_ascii_case(path));
         self.recent.insert(0, path.to_owned());
         self.recent.truncate(MAX_RECENT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn damaged_settings_do_not_turn_auto_update_back_on() {
+        let (s, corrupt) = Settings::parse(Some(br#"{"auto_update":false,"recent":null}"#));
+        assert!(corrupt);
+        assert!(!s.auto_update);
+        let (s, corrupt) = Settings::parse(Some(b"\0\0garbage"));
+        assert!(corrupt && !s.auto_update);
+    }
+
+    #[test]
+    fn missing_or_valid_settings_load_normally() {
+        assert!(Settings::parse(None).0.auto_update, "first start: default on");
+        let (s, corrupt) = Settings::parse(Some(br#"{"auto_update":false}"#));
+        assert!(!corrupt && !s.auto_update);
+        let (s, _) = Settings::parse(Some(br#"{"recent":["C:\\"]}"#));
+        assert!(s.auto_update && s.recent == ["C:\\"], "missing fields take defaults");
     }
 }

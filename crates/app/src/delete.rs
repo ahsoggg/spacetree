@@ -24,6 +24,8 @@ pub struct Pending {
     pub link: bool,
     pub size: u64,
     pub system: bool,
+    /// `App::scans` when the ids were taken: they are only valid for that tree.
+    pub scan: u64,
 }
 
 pub struct Running {
@@ -36,6 +38,8 @@ pub struct Running {
 }
 
 struct Outcome {
+    /// `App::scans` of the tree the node ids belong to.
+    scan: u64,
     /// Nodes that are gone from disk.
     removed: Vec<NodeId>,
     /// Duplicates that now share the data of the kept copy.
@@ -54,6 +58,18 @@ pub struct DeleteState {
 impl DeleteState {
     pub fn idle(&self) -> bool {
         self.pending.is_none() && self.running.is_none()
+    }
+
+    /// A new tree was installed: a confirmation still on screen refers to nodes of the old one.
+    pub fn tree_replaced(&mut self) {
+        self.pending = None;
+    }
+
+    /// The finished outcome, unless the tree it refers to has been replaced since (`Err`: report it, but do
+    /// not touch the current tree — its node ids mean other files).
+    fn take_waiting(&mut self, current_scan: u64) -> Option<Result<Outcome, Outcome>> {
+        let o = self.waiting.take()?;
+        Some(if o.scan == current_scan { Ok(o) } else { Err(o) })
     }
 }
 
@@ -147,6 +163,7 @@ impl App {
             permanent,
             empty_bin: false,
             link: false,
+            scan: self.scans,
         };
         if !pending.permanent && !pending.system && !self.settings.confirm_delete {
             self.start_delete(pending);
@@ -169,6 +186,7 @@ impl App {
             empty_bin: false,
             link: true,
             system: false,
+            scan: self.scans,
         });
     }
 
@@ -182,12 +200,17 @@ impl App {
             link: false,
             size,
             system: false,
+            scan: self.scans,
         });
     }
 
     fn start_delete(&mut self, p: Pending) {
         if crate::settings::is_demo() {
             self.toast("В демо-режиме ничего не удаляется", ToastKind::Info);
+            return;
+        }
+        if p.scan != self.scans {
+            self.toast("Список изменился после пересканирования — выберите файлы заново", ToastKind::Error);
             return;
         }
         let Some(data) = self.data.clone() else { return };
@@ -213,9 +236,10 @@ impl App {
         let current = Arc::new(Mutex::new(String::new()));
         let total = jobs.iter().map(|j| j.2).sum::<u64>().max(1);
         let (d2, c2) = (done.clone(), current.clone());
-        let (permanent, empty_bin, link) = (p.permanent, p.empty_bin, p.link);
+        let (permanent, empty_bin, link, scan) = (p.permanent, p.empty_bin, p.link, p.scan);
         std::thread::spawn(move || {
             let mut out = Outcome {
+                scan,
                 removed: Vec::new(),
                 linked: Vec::new(),
                 failed: Vec::new(),
@@ -223,7 +247,8 @@ impl App {
             if link {
                 for ((id, path, w), keep) in jobs.into_iter().zip(keep_paths) {
                     *c2.lock().unwrap() = path.clone();
-                    match spacetree_core::dupes::replace_with_hardlink(keep.as_ref(), path.as_ref()) {
+                    let (keep, dup) = (spacetree_core::fs_path(&keep), spacetree_core::fs_path(&path));
+                    match spacetree_core::dupes::replace_with_hardlink(&keep, &dup) {
                         Ok(()) => out.linked.push(id),
                         Err(e) => out.failed.push((path, e.to_string())),
                     }
@@ -237,7 +262,8 @@ impl App {
             } else {
                 for (id, path, w) in jobs {
                     *c2.lock().unwrap() = path.clone();
-                    let p = Path::new(&path);
+                    let fs = spacetree_core::fs_path(&path);
+                    let p = fs.as_path();
                     let before = d2.load(Relaxed);
                     let res = if permanent {
                         if p.is_dir() && !p.is_symlink() {
@@ -245,6 +271,9 @@ impl App {
                         } else {
                             remove_file_progress(p, &d2)
                         }
+                    } else if !recycle_safe(&path) {
+                        Err("имя оканчивается точкой или пробелом — Корзина такие не принимает, удалите безвозвратно"
+                            .into())
                     } else {
                         winint::recycle(&path)
                     };
@@ -296,8 +325,20 @@ impl App {
                 }
             }
         }
-        let Some(outcome) = self.delete.waiting.take() else {
-            return;
+        let outcome = match self.delete.take_waiting(self.scans) {
+            None => return,
+            Some(Ok(o)) => o,
+            Some(Err(stale)) => {
+                self.toast(
+                    format!(
+                        "Удаление завершено (удалено {}, ошибок {}), дерево уже пересканировано — нажмите F5",
+                        stale.removed.len() + stale.linked.len(),
+                        stale.failed.len()
+                    ),
+                    ToastKind::Info,
+                );
+                return;
+            }
         };
         let Some(data) = self.data.as_mut().and_then(std::sync::Arc::get_mut) else {
             self.delete.waiting = Some(outcome); // a background reader still holds the tree; retry next frame
@@ -467,3 +508,90 @@ impl App {
         }
     }
 }
+
+/// The recycle bin (SHFileOperation) only takes Win32 paths, whose normalisation strips trailing dots and spaces
+/// from names: for such a name it would act on a different file.
+fn recycle_safe(path: &str) -> bool {
+    path.split(['\\', '/']).skip(1).all(|c| !c.ends_with(['.', ' ']))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(scan: u64) -> Outcome {
+        Outcome {
+            scan,
+            removed: vec![7],
+            linked: Vec::new(),
+            failed: Vec::new(),
+        }
+    }
+
+    /// Node ids of a finished deletion must not be applied to a tree from a later scan.
+    #[test]
+    fn outcome_of_a_replaced_tree_is_not_applied() {
+        let mut d = DeleteState {
+            waiting: Some(outcome(1)),
+            ..Default::default()
+        };
+        assert!(matches!(d.take_waiting(2), Some(Err(_))));
+        d.waiting = Some(outcome(2));
+        assert!(matches!(d.take_waiting(2), Some(Ok(o)) if o.removed == [7]));
+        assert!(d.take_waiting(2).is_none());
+    }
+
+    #[test]
+    fn installing_a_tree_drops_the_pending_confirmation() {
+        let mut d = DeleteState {
+            pending: Some(Pending {
+                ids: vec![3],
+                permanent: true,
+                empty_bin: false,
+                link: false,
+                size: 0,
+                system: false,
+                scan: 1,
+            }),
+            ..Default::default()
+        };
+        d.tree_replaced();
+        assert!(d.idle());
+    }
+
+    /// NTFS allows `a.` next to `a`; Win32 path normalisation turns `a.` into `a`.
+    #[cfg(windows)]
+    #[test]
+    fn name_with_trailing_dot_deletes_itself_not_its_twin() {
+        let dir = std::env::temp_dir().join(format!("spacetree-dot-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.to_str().unwrap().to_owned();
+        let verbatim = |name: &str| std::path::PathBuf::from(format!(r"\\?\{base}\{name}"));
+        std::fs::write(verbatim("a"), b"keep me").unwrap();
+        std::fs::write(verbatim("a."), b"delete me").unwrap();
+        std::fs::create_dir(verbatim("d ")).unwrap();
+        std::fs::write(verbatim(r"d \f"), b"x").unwrap();
+        std::fs::create_dir(verbatim("d")).unwrap();
+        std::fs::write(verbatim(r"d\keep"), b"x").unwrap();
+
+        let done = AtomicU64::new(0);
+        let tree_path = |name: &str| format!(r"{base}\{name}"); // what Tree::path returns
+        remove_file_progress(&spacetree_core::fs_path(&tree_path("a.")), &done).unwrap();
+        remove_dir_progress(&spacetree_core::fs_path(&tree_path("d ")), &done, &Mutex::default()).unwrap();
+
+        assert_eq!(std::fs::read(verbatim("a")).unwrap(), b"keep me");
+        assert!(std::fs::symlink_metadata(verbatim("a.")).is_err());
+        assert!(verbatim(r"d\keep").exists());
+        assert!(std::fs::symlink_metadata(verbatim("d ")).is_err());
+        let _ = std::fs::remove_dir_all(format!(r"\\?\{base}"));
+    }
+
+    #[test]
+    fn recycle_bin_refuses_names_it_would_mangle() {
+        assert!(recycle_safe(r"C:\x\a.txt"));
+        assert!(recycle_safe(r"C:\"));
+        assert!(!recycle_safe(r"C:\x\a."));
+        assert!(!recycle_safe(r"C:\dir \a.txt"));
+    }
+}
+
