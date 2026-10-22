@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "spacetree"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "clap",
  "spacetree-core",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "spacetree-app"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "eframe",
  "embed-resource",
@@ -3274,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "spacetree-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "rayon",
