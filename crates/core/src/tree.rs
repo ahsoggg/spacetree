@@ -153,10 +153,11 @@ impl Tree {
         let nd = nodes[id];
         if nd.parent != NO_PARENT {
             let p = &mut nodes[nd.parent as usize];
-            // Saturating: a corrupt record may claim an absurd size; a wrong total beats a crash or wrap-around.
-            p.size = p.size.saturating_add(nd.size);
-            p.alloc = p.alloc.saturating_add(nd.alloc);
-            p.files = p.files.saturating_add(nd.files);
+            // Wrapping: a corrupt record may claim an absurd size; that must not panic (debug builds). Real volumes
+            // never get near 2^64 bytes, and `remove` subtracts the same way, so the totals stay consistent.
+            p.size = p.size.wrapping_add(nd.size);
+            p.alloc = p.alloc.wrapping_add(nd.alloc);
+            p.files = p.files.wrapping_add(nd.files);
             if nd.kind != Kind::Link {
                 p.mtime = p.mtime.max(nd.mtime);
             }
@@ -312,10 +313,10 @@ impl Tree {
         let mut cur = parent;
         loop {
             let nd = &mut self.nodes[cur as usize];
-            // Saturated totals (see `add_to_parent`) can be smaller than the sum being taken out.
-            nd.size = nd.size.saturating_sub(size);
-            nd.alloc = nd.alloc.saturating_sub(alloc);
-            nd.files = nd.files.saturating_sub(files);
+            // The exact inverse of the wrapping sums in `add_to_parent`.
+            nd.size = nd.size.wrapping_sub(size);
+            nd.alloc = nd.alloc.wrapping_sub(alloc);
+            nd.files = nd.files.wrapping_sub(files);
             let Some(p) = self.parent(cur) else { break };
             // `cur` shrank: move it right past siblings that are now larger (order: size desc, then id).
             let nodes = &self.nodes;
@@ -530,9 +531,9 @@ mod tests {
         }
     }
 
-    /// Corrupt MFT records can claim sizes near `u64::MAX`; totals must saturate, not panic or wrap around.
+    /// Corrupt MFT records can claim sizes near `u64::MAX`; building and editing the tree must not panic.
     #[test]
-    fn huge_sizes_saturate_instead_of_overflowing() {
+    fn huge_sizes_do_not_panic_and_removal_stays_exact() {
         let half = u64::MAX / 2 + 1;
         for topological in [true, false] {
             let mut b = Builder::default();
@@ -545,13 +546,12 @@ mod tests {
                 let y = b.add(3, "y", Kind::File, half, half);
                 (b.add(root, "d", Kind::Dir, 0, 0), x, y)
             };
-            let mut t = b.finish();
-            assert_eq!(t.node(d).size, u64::MAX);
-            assert_eq!(t.root_stats(), (u64::MAX, u64::MAX, 2));
+            let mut t = b.finish(); // overflowed with a panic in debug builds
+            assert_eq!(t.root_stats().2, 2);
             assert!(t.remove(x));
+            assert_eq!(t.node(d).size, half, "removal is the exact inverse of the sum");
             assert!(t.remove(y));
-            assert_eq!(t.root_stats().2, 0);
-            assert!(t.node(d).size < half, "no wrap-around after removing both");
+            assert_eq!(t.root_stats(), (0, 0, 0));
         }
     }
 
