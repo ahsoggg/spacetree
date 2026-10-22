@@ -51,10 +51,10 @@ pub struct ScanOutput {
     pub notes: Vec<String>,
 }
 
-/// Drive letter if `path` is a bare volume root (`C:`, `C:\`, `\?\C:\`).
+/// Drive letter if `path` is a bare volume root (`C:`, `C:\`, `\\?\C:\`).
 pub fn drive_of_root(path: &Path) -> Option<char> {
     let s = path.to_string_lossy();
-    let s = s.strip_prefix(r"\?\").unwrap_or(&s);
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
     let mut it = s.chars();
     let letter = it.next().filter(char::is_ascii_alphabetic)?;
     if it.next() != Some(':') {
@@ -146,4 +146,27 @@ fn scan_mft(path: &Path, selection: Selection, progress: &Progress, start: Insta
 #[cfg(not(windows))]
 fn scan_mft(_: &Path, _: Selection, _: &Progress, _: Instant) -> Result<ScanOutput, ScanError> {
     Err(ScanError::Unsupported("бэкенд mft доступен только в Windows".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drive_of_root;
+    use std::path::Path;
+
+    #[test]
+    fn drive_roots_are_recognised_with_and_without_verbatim_prefix() {
+        for (p, want) in [
+            ("C:", Some('C')),
+            ("d:\\", Some('D')),
+            ("E:/", Some('E')),
+            (r"\\?\C:\", Some('C')),
+            (r"\\?\c:", Some('C')),
+            (r"C:\Users", None),
+            (r"\\?\C:\Users", None),
+            (r"\\server\share", None),
+            ("", None),
+        ] {
+            assert_eq!(drive_of_root(Path::new(p)), want, "{p}");
+        }
+    }
 }

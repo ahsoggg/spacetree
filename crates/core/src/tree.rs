@@ -153,9 +153,10 @@ impl Tree {
         let nd = nodes[id];
         if nd.parent != NO_PARENT {
             let p = &mut nodes[nd.parent as usize];
-            p.size += nd.size;
-            p.alloc += nd.alloc;
-            p.files += nd.files;
+            // Saturating: a corrupt record may claim an absurd size; a wrong total beats a crash or wrap-around.
+            p.size = p.size.saturating_add(nd.size);
+            p.alloc = p.alloc.saturating_add(nd.alloc);
+            p.files = p.files.saturating_add(nd.files);
             if nd.kind != Kind::Link {
                 p.mtime = p.mtime.max(nd.mtime);
             }
@@ -311,9 +312,10 @@ impl Tree {
         let mut cur = parent;
         loop {
             let nd = &mut self.nodes[cur as usize];
-            nd.size -= size;
-            nd.alloc -= alloc;
-            nd.files -= files;
+            // Saturated totals (see `add_to_parent`) can be smaller than the sum being taken out.
+            nd.size = nd.size.saturating_sub(size);
+            nd.alloc = nd.alloc.saturating_sub(alloc);
+            nd.files = nd.files.saturating_sub(files);
             let Some(p) = self.parent(cur) else { break };
             // `cur` shrank: move it right past siblings that are now larger (order: size desc, then id).
             let nodes = &self.nodes;
@@ -525,6 +527,31 @@ mod tests {
             a.sort_unstable();
             b.sort_unstable();
             assert_eq!(a, b);
+        }
+    }
+
+    /// Corrupt MFT records can claim sizes near `u64::MAX`; totals must saturate, not panic or wrap around.
+    #[test]
+    fn huge_sizes_saturate_instead_of_overflowing() {
+        let half = u64::MAX / 2 + 1;
+        for topological in [true, false] {
+            let mut b = Builder::default();
+            let root = b.add(NO_PARENT, "r", Kind::Dir, 0, 0);
+            let (d, x, y) = if topological {
+                let d = b.add(root, "d", Kind::Dir, 0, 0);
+                (d, b.add(d, "x", Kind::File, half, half), b.add(d, "y", Kind::File, half, half))
+            } else {
+                let x = b.add(3, "x", Kind::File, half, half);
+                let y = b.add(3, "y", Kind::File, half, half);
+                (b.add(root, "d", Kind::Dir, 0, 0), x, y)
+            };
+            let mut t = b.finish();
+            assert_eq!(t.node(d).size, u64::MAX);
+            assert_eq!(t.root_stats(), (u64::MAX, u64::MAX, 2));
+            assert!(t.remove(x));
+            assert!(t.remove(y));
+            assert_eq!(t.root_stats().2, 0);
+            assert!(t.node(d).size < half, "no wrap-around after removing both");
         }
     }
 

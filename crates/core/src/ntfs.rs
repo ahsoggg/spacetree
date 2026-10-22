@@ -315,7 +315,8 @@ pub fn parse_runs(mut b: &[u8]) -> Result<Vec<Run>, ScanError> {
             Some(lcn as u64)
         };
         runs.push(Run { vcn, len, lcn: run_lcn });
-        vcn += len;
+        // Runs end at or before u64::MAX, so `vcn + len` never overflows for any returned run.
+        vcn = vcn.checked_add(len).ok_or_else(bad)?;
         b = &b[1 + ls + os..];
     }
     Ok(runs)
@@ -626,6 +627,23 @@ mod tests {
                 lcn: None
             }
         );
+    }
+
+    /// Corrupt run lists (deleted records, damaged volumes) must be rejected, not overflow the VCN counter.
+    #[test]
+    fn run_list_with_overflowing_lengths_is_rejected() {
+        // two sparse runs of 2^64-1 clusters each: the second one would start past u64::MAX
+        let mut b = vec![0x08];
+        b.extend([0xFF; 8]);
+        b.push(0x08);
+        b.extend([0xFF; 8]);
+        b.push(0);
+        assert!(parse_runs(&b).is_err());
+        // a single run ending exactly at u64::MAX is still representable
+        let mut one = vec![0x08];
+        one.extend([0xFF; 8]);
+        one.push(0);
+        assert_eq!(parse_runs(&one).unwrap().len(), 1);
     }
 
     #[test]

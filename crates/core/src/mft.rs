@@ -116,10 +116,17 @@ pub(crate) fn read_virtual(file: &File, runs: &[Run], bpc: u64, mut voff: u64, b
             .find(|r| vcn >= r.vcn && vcn < r.vcn + r.len)
             .ok_or_else(|| io::Error::other("смещение вне data runs $MFT"))?;
         let into = voff - run.vcn * bpc;
-        let n = ((run.len * bpc - into) as usize).min(buf.len() - done);
+        let left_in_run = run.len.saturating_mul(bpc) - into;
+        let n = left_in_run.min((buf.len() - done) as u64) as usize;
         let dst = &mut buf[done..done + n];
         match run.lcn {
-            Some(l) => read_exact_at(file, dst, l * bpc + into)?,
+            Some(l) => {
+                let at = l
+                    .checked_mul(bpc)
+                    .and_then(|b| b.checked_add(into))
+                    .ok_or_else(|| io::Error::other("смещение data run вне тома"))?;
+                read_exact_at(file, dst, at)?
+            }
             None => dst.fill(0),
         }
         done += n;
@@ -137,7 +144,11 @@ pub(crate) fn data_extents(attr: &[u8]) -> Result<(Vec<Run>, u64), ScanError> {
     let roff = u16::from_le_bytes([attr[0x20], attr[0x21]]) as usize;
     let mut runs = ntfs::parse_runs(attr.get(roff..).unwrap_or(&[]))?;
     for r in &mut runs {
-        r.vcn += start;
+        r.vcn = r
+            .vcn
+            .checked_add(start)
+            .filter(|v| v.checked_add(r.len).is_some())
+            .ok_or_else(|| ScanError::Ntfs("повреждённый список data runs".into()))?;
     }
     Ok((runs, real))
 }
@@ -161,6 +172,9 @@ pub(crate) fn mft_extents(file: &File, info: &VolumeInfo) -> Result<MftLayout, S
 
     // A heavily fragmented $MFT spills its $DATA extents into extension records listed in $ATTRIBUTE_LIST.
     if let Some(list) = ntfs::find_attr(rec0, ATTR_ATTRIBUTE_LIST) {
+        if list.len() < 0x18 {
+            return Err(ScanError::Ntfs("битый $ATTRIBUTE_LIST".into()));
+        }
         if list[8] != 0 {
             return Err(ScanError::Unsupported(
                 "нерезидентный $ATTRIBUTE_LIST у $MFT не поддерживается".into(),
@@ -190,8 +204,14 @@ pub(crate) fn mft_extents(file: &File, info: &VolumeInfo) -> Result<MftLayout, S
         runs.sort_by_key(|r| r.vcn);
     }
     runs.sort_by_key(|r| r.vcn);
+    // The real size never exceeds what the runs allocate; a corrupt one would make the scan chase records that
+    // do not exist (billions of chunk reads, each failing).
+    let allocated = runs
+        .iter()
+        .map(|r| r.len.saturating_mul(bpc))
+        .fold(0u64, u64::saturating_add);
     let bitmap = read_bitmap(file, rec0, bpc);
-    Ok((runs, real_size, bitmap))
+    Ok((runs, real_size.min(allocated), bitmap))
 }
 
 /// `$MFT`'s own `$BITMAP`: one bit per record, set when the record is in use. `None` when it cannot be read
@@ -363,6 +383,57 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
         extra_links: built.extra_links,
         timings,
     })
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::{VolumeInfo, mft_extents};
+    use crate::ntfs::testutil::{nonresident_data, record};
+
+    const BPC: u64 = 4096;
+
+    /// A fake volume: record 0 of $MFT at cluster 1, nothing else.
+    fn volume_with_record0(attrs: &[Vec<u8>]) -> (tempfile::NamedTempFile, VolumeInfo) {
+        let mut img = vec![0u8; 4 * BPC as usize];
+        let rec = record(0x01, 0, attrs);
+        img[BPC as usize..BPC as usize + rec.len()].copy_from_slice(&rec);
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), &img).unwrap();
+        let info = VolumeInfo {
+            bytes_per_cluster: BPC,
+            record_size: 1024,
+            total_clusters: 4,
+            mft_start_lcn: 1,
+        };
+        (f, info)
+    }
+
+    /// $DATA of $MFT: one cluster at LCN 1, claiming `real` bytes.
+    fn mft_data(real: u64) -> Vec<u8> {
+        let mut a = nonresident_data(real, BPC, 0, 0, None);
+        a[0x48..0x4C].copy_from_slice(&[0x11, 0x01, 0x01, 0x00]);
+        a
+    }
+
+    #[test]
+    fn truncated_attribute_list_is_an_error_not_a_panic() {
+        let mut list = vec![0u8; 0x10];
+        list[0..4].copy_from_slice(&0x20u32.to_le_bytes());
+        list[4..8].copy_from_slice(&0x10u32.to_le_bytes());
+        let (f, info) = volume_with_record0(&[list, mft_data(BPC)]);
+        let file = std::fs::File::open(f.path()).unwrap();
+        assert!(mft_extents(&file, &info).is_err());
+    }
+
+    /// A corrupt real size must not make the scan walk 2^54 records that do not exist.
+    #[test]
+    fn real_size_is_capped_by_the_allocated_runs() {
+        let (f, info) = volume_with_record0(&[mft_data(u64::MAX)]);
+        let file = std::fs::File::open(f.path()).unwrap();
+        let (runs, real, _) = mft_extents(&file, &info).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(real, BPC);
+    }
 }
 
 #[cfg(test)]
