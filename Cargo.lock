@@ -3308,15 +3308,16 @@ dependencies = [
 
 [[package]]
 name = "spacetree"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
+ "serde_json",
  "spacetree-core",
 ]
 
 [[package]]
 name = "spacetree-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ed25519-dalek",
  "eframe",
@@ -3334,10 +3335,11 @@ dependencies = [
 
 [[package]]
 name = "spacetree-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "rayon",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",

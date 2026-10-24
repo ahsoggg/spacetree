@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai;
 mod chrome;
 mod compress;
 mod delete;
@@ -217,6 +218,8 @@ pub enum Action {
     Delete(NodeId, bool),
     /// Compress (`false`) or decompress (`true`) with LZX.
     Compress(NodeId, bool),
+    /// Ask the AI helper what the folder is.
+    AskAi(NodeId),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -304,6 +307,7 @@ pub struct App {
     pub streams: streams::StreamsState,
     pub growth: growth::Growth,
     pub recover: recover::Recover,
+    pub ai: ai::AiState,
     dup_job: Option<DupJob>,
     /// Search result waiting for the tree to be free (a deletion may hold it).
     dup_pending: Option<Vec<DupSet>>,
@@ -467,6 +471,7 @@ impl App {
             streams: streams::StreamsState::default(),
             growth: growth::Growth::default(),
             recover: recover::Recover::default(),
+            ai: ai::AiState::default(),
             dup_job: None,
             dup_pending: None,
             demo: None,
@@ -891,6 +896,7 @@ impl App {
             }
             Action::Delete(id, permanent) => self.request_delete(vec![id], permanent),
             Action::Compress(id, undo) => self.request_compress(id, undo),
+            Action::AskAi(id) => self.ai_explain_folder(id),
         }
     }
 
@@ -929,6 +935,17 @@ impl App {
         if let Some(data) = self.data.clone() {
             sort_list(&data.out.tree, &mut self.search_hits, self.search_sort);
         }
+    }
+
+    /// Shows `hits` as the search result for the (already evaluated) request `shown`.
+    pub fn set_search_hits(&mut self, shown: &str, mut hits: Vec<NodeId>) {
+        self.search_done = shown.trim().to_lowercase();
+        self.search_truncated = false;
+        self.tab = Tab::Overview;
+        if let Some(data) = &self.data {
+            sort_list(&data.out.tree, &mut hits, self.search_sort);
+        }
+        self.search_hits = hits;
     }
 
     pub fn search_active(&self) -> bool {
@@ -971,6 +988,7 @@ impl App {
         }
         self.poll_live(&ctx);
         self.poll_dups();
+        self.poll_ai(&ctx);
         self.poll_update();
         self.demo_step(&ctx);
         if let Some((text, kind)) = self.status.lock().unwrap().take() {
@@ -1052,6 +1070,7 @@ impl App {
         self.stream_dialogs(&ctx);
         self.recover_window(&ctx);
         self.settings_window(&ctx);
+        self.ai_window(&ctx);
         self.draw_toasts(&ctx);
     }
 }

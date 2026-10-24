@@ -7,6 +7,7 @@ pub mod export;
 pub mod ntfs;
 pub mod orphans;
 pub mod progress;
+pub mod query;
 pub mod scan;
 pub mod snapshot;
 pub mod stats;

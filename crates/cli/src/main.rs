@@ -3,14 +3,19 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod mcp;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use spacetree_core::{Backend, Progress, export, scan, stats, stats::human_size as human};
 
 #[derive(Parser)]
 #[command(name = "spacetree", about = "Анализатор занятого места на диске")]
 struct Cli {
+    /// Работать как MCP-сервер (stdin/stdout) для ИИ-агентов: только чтение, без сети
+    #[arg(long)]
+    mcp: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -67,7 +72,12 @@ fn normalize(p: PathBuf) -> PathBuf {
 }
 
 fn main() -> ExitCode {
-    let Cmd::Scan {
+    let cli = Cli::parse();
+    if cli.mcp {
+        mcp::run();
+        return ExitCode::SUCCESS;
+    }
+    let Some(Cmd::Scan {
         path,
         backend,
         top,
@@ -75,7 +85,11 @@ fn main() -> ExitCode {
         cleanup,
         dupes,
         timings,
-    } = Cli::parse().cmd;
+    }) = cli.cmd
+    else {
+        eprintln!("Укажите команду (scan) или --mcp; справка: --help");
+        return ExitCode::FAILURE;
+    };
     let path = normalize(path);
     let progress = Progress::default();
     let out = match scan(&path, backend.into(), &progress) {

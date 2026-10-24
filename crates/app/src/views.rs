@@ -58,6 +58,9 @@ pub(crate) fn node_menu(ui: &mut Ui, tree: &Tree, id: NodeId, act: &mut Option<A
     item(ui, "Показать в Проводнике", Action::Reveal(id));
     item(ui, "Открыть", Action::Open(id));
     item(ui, "Копировать путь", Action::CopyPath(id));
+    if crate::ai::enabled() && tree.is_dir(id) && id != ROOT {
+        item(ui, "Что это за папка? (ИИ)", Action::AskAi(id));
+    }
     if cfg!(windows) && id != ROOT && tree.node(id).kind != Kind::Link {
         ui.separator();
         item(

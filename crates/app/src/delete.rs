@@ -220,6 +220,22 @@ impl App {
     pub fn request_hardlink(&mut self, ids: Vec<NodeId>) {
         let Some(data) = self.data.clone() else { return };
         let ids: Vec<NodeId> = ids.into_iter().filter(|i| data.dup_keep.contains_key(i)).collect();
+        // Databases, logs and settings are rewritten in place: one shared file would corrupt the other copy.
+        let tree = &data.out.tree;
+        let (ids, mutable): (Vec<NodeId>, Vec<NodeId>) = ids.into_iter().partition(|&i| {
+            let keep = data.dup_keep[&i];
+            spacetree_core::dupes::hardlink_allowed(std::path::Path::new(tree.name(i)))
+                && spacetree_core::dupes::hardlink_allowed(std::path::Path::new(tree.name(keep)))
+        });
+        if !mutable.is_empty() {
+            self.toast(
+                format!(
+                    "Пропущено {}: изменяемые форматы (.db, .log, .json, .ini…) нельзя склеивать ссылками",
+                    mutable.len()
+                ),
+                ToastKind::Info,
+            );
+        }
         if ids.is_empty() {
             return;
         }

@@ -88,9 +88,24 @@ not give you:
 
 The private key stays on the author's machine; `*.pfx` files are git-ignored.
 
+## AI helper and MCP (optional)
+
+Off by default. Turn it on in Settings (⚙ → *AI helper*); it only talks to a local [Ollama](https://ollama.com):
+the address must be `localhost` / `127.x.x.x` / `[::1]`, proxies and redirects are disabled, so no request leaves
+the computer. A separate, explicit switch selects **Claude Code (cloud)**: SpaceTree runs your installed `claude -p` (your subscription, no tools, no disk access), and then names, sizes and dates go to Anthropic. The model receives folder and file names, sizes and dates — never contents.
+
+- Right-click a folder → **What is this folder? (AI)** — what it is, whether it is safe to delete.
+- **✨ In words** next to the search box — "archives and installers over 500 MB older than half a year, except
+  games". The model only writes a JSON filter; SpaceTree's own code does the matching (`core::query`).
+- *What grew* tab → **Explain what grew**.
+
+`spacetree-cli --mcp` runs SpaceTree as an MCP server (stdio) for editor agents (Lumen Code, Claude Code…): tools
+`scan`, `list_folder`, `find`, `explain_folder`, `cleanup_candidates`, `what_grew`. Read-only, no network; the
+server cannot delete anything.
+
 ## Diagnostics and privacy
 
-SpaceTree sends nothing anywhere except the update check to GitHub. For troubleshooting it keeps, locally:
+SpaceTree sends nothing anywhere except the update check to GitHub (the AI helper, if you turn it on, talks only to a local Ollama). For troubleshooting it keeps, locally:
 
 - `%APPDATA%\SpaceTree\logs\spacetree.log` — scans, failed deletions, update problems (rotated at 512 KB);
 - `%APPDATA%\SpaceTree\logs\crashes\crash-<time>.txt` — written if the program crashes: version, panic

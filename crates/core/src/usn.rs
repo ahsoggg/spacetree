@@ -12,7 +12,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::winapi;
 
@@ -36,6 +36,9 @@ const REASON_MASK: u32 = REASON_DATA_OVERWRITE
 const ATTR_DIRECTORY: u32 = 0x10;
 const FRN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const POLL: Duration = Duration::from_millis(400);
+/// While the journal is busy (a build, an unpacked archive) its records are merged per file for at most this
+/// long and then handed over, so the consumer gets steady batches instead of one huge one at the end.
+const FLUSH_EVERY: Duration = Duration::from_millis(250);
 /// Distinct files merged per poll; more activity than this is counted as dropped, not buffered without bound.
 const MAX_BATCH: usize = 20_000;
 const READ_BUF: usize = 256 * 1024;
@@ -285,7 +288,10 @@ fn watch(
     let mut buf = vec![0u8; READ_BUF];
     while !stop.load(Relaxed) {
         let mut batch = Batch::default();
-        loop {
+        let started = Instant::now();
+        // Whether the journal was read up to its end; a busy one is flushed part by part and read on at once,
+        // the kernel's ring buffer must not wrap around while this thread is classifying files.
+        let caught_up = loop {
             let n = match winapi::usn_read(&volume, journal_id, *next, REASON_MASK, &mut buf) {
                 Ok(n) => n,
                 Err(e) => {
@@ -296,7 +302,7 @@ fn watch(
             };
             let (nx, records) = parse_records(&buf[..n]);
             if nx <= *next {
-                break; // caught up
+                break true;
             }
             *next = nx;
             for r in records {
@@ -305,7 +311,10 @@ fn watch(
             if stop.load(Relaxed) {
                 return;
             }
-        }
+            if started.elapsed() >= FLUSH_EVERY || batch.len() >= MAX_BATCH / 2 {
+                break false;
+            }
+        };
         stats.dropped.fetch_add(batch.dropped, Relaxed);
         stats.events.fetch_add(batch.len() as u64, Relaxed);
         let mut sent = false;
@@ -319,6 +328,9 @@ fn watch(
         }
         if sent {
             wake();
+        }
+        if !caught_up {
+            continue;
         }
         let mut waited = Duration::ZERO;
         while waited < POLL && !stop.load(Relaxed) {

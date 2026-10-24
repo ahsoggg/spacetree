@@ -265,7 +265,10 @@ fn steam_library(steamapps: &Path) -> Option<(HashSet<String>, HashSet<String>)>
             continue;
         };
         if let Some(dir) = vdf_value(&text, "installdir") {
-            dirs.insert(dir.to_lowercase());
+            // `installdir` may be a sub-path (`Foo\Bar`): the folder under `common` is its first component
+            if let Some(first) = dir.split(['\\', '/']).find(|c| !c.is_empty() && *c != ".") {
+                dirs.insert(first.to_lowercase());
+            }
         }
         if let Some(id) = vdf_value(&text, "appid") {
             ids.insert(id);
@@ -349,6 +352,20 @@ fn epic_manifest_dir() -> Option<std::path::PathBuf> {
     Some(Path::new(&pd).join(r"Epic\EpicGamesLauncher\Data\Manifests"))
 }
 
+/// Whether a launcher manifest covers `folder` (normalised): it names the folder itself, a place inside it (the
+/// manifest points at `...\Game\Binaries`) or a place that holds it (a broken manifest pointing at the
+/// `Epic Games` root or a drive). In the last case nothing below can be judged, so it counts as known.
+fn epic_knows(known: &HashSet<String>, folder: &str) -> bool {
+    let inside = |outer: &str, inner: &str| {
+        inner.len() > outer.len()
+            && inner.starts_with(outer)
+            && (outer.ends_with('\\') || inner.as_bytes()[outer.len()] == b'\\')
+    };
+    known
+        .iter()
+        .any(|k| k == folder || inside(k, folder) || inside(folder, k))
+}
+
 fn epic_orphans(tree: &Tree, known: &HashSet<String>) -> Vec<NodeId> {
     let mut out = Vec::new();
     for games in find_dirs(tree, "Epic Games") {
@@ -357,7 +374,7 @@ fn epic_orphans(tree: &Tree, known: &HashSet<String>) -> Vec<NodeId> {
             if !tree.is_dir(c)
                 || tree.node(c).size < ORPHAN_MIN
                 || SYSTEM_EPIC.iter().any(|s| norm(name) == *s)
-                || known.contains(&normalise_path(&tree.path(c)))
+                || epic_knows(known, &normalise_path(&tree.path(c)))
             {
                 continue;
             }
@@ -365,6 +382,26 @@ fn epic_orphans(tree: &Tree, known: &HashSet<String>) -> Vec<NodeId> {
         }
     }
     out
+}
+
+/// Hard limit on what may ever be offered as "orphaned": a folder exactly one level below
+/// `AppData\{Roaming,Local,LocalLow}`, `steamapps\{common,compatdata,shadercache}` or `Epic Games`. Whatever the
+/// matching above concluded, a drive root, `Program Files`, a games library or a user profile never passes.
+fn allowed_depth(tree: &Tree, id: NodeId) -> bool {
+    let name = tree.name(id);
+    if name.is_empty() || name.contains(['\\', '/', ':']) || !tree.is_dir(id) {
+        return false;
+    }
+    let Some(parent) = tree.parent(id) else { return false };
+    let pname = tree.name(parent);
+    let is = |n: NodeId, s: &str| tree.name(n).eq_ignore_ascii_case(s);
+    let grand = tree.parent(parent);
+    let under = |names: &[&str], holder: &str| {
+        names.iter().any(|n| pname.eq_ignore_ascii_case(n)) && grand.is_some_and(|g| is(g, holder))
+    };
+    under(&["Roaming", "Local", "LocalLow"], "AppData")
+        || under(&["common", "compatdata", "shadercache"], "steamapps")
+        || pname.eq_ignore_ascii_case("Epic Games")
 }
 
 /// Finds the orphaned-data groups. `claimed` are the items of the other cleanup groups: their space inside an
@@ -389,7 +426,10 @@ fn find_with(tree: &Tree, installed: &Installed, epic: Option<&HashSet<String>>,
         out.extend(dir_group(
             tree,
             Category::OrphanedData,
-            appdata_orphans(tree, &all, &offered),
+            appdata_orphans(tree, &all, &offered)
+                .into_iter()
+                .filter(|&i| allowed_depth(tree, i))
+                .collect(),
             claimed,
         ));
     }
@@ -397,7 +437,7 @@ fn find_with(tree: &Tree, installed: &Installed, epic: Option<&HashSet<String>>,
     if let Some(known) = epic {
         games.extend(epic_orphans(tree, known));
     }
-    games.retain(|&i| tree.node(i).kind == Kind::Dir);
+    games.retain(|&i| tree.node(i).kind == Kind::Dir && allowed_depth(tree, i));
     out.extend(dir_group(tree, Category::OrphanedGames, games, claimed));
     out
 }
@@ -600,5 +640,61 @@ mod tests {
         let d = b.add(common, "Mystery", Kind::Dir, 0, 0);
         b.add(d, "f", Kind::File, 100 * MB, 100 * MB);
         assert!(find_with(&b.finish(), &Installed::default(), None, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_manifest_pointing_at_a_parent_or_a_subfolder_still_covers_the_game() {
+        let known = |l: &[&str]| -> HashSet<String> { l.iter().map(|p| normalise_path(p)).collect() };
+        let game = normalise_path(r"D:\Epic Games\Foo");
+        assert!(epic_knows(&known(&[r"D:\Epic Games\Foo"]), &game));
+        assert!(epic_knows(&known(&[r"D:\Epic Games\Foo\Binaries"]), &game), "subfolder");
+        assert!(
+            epic_knows(&known(&[r"D:\Epic Games"]), &game),
+            "broken manifest: the library root"
+        );
+        assert!(epic_knows(&known(&[r"D:"]), &game), "broken manifest: a drive");
+        assert!(
+            !epic_knows(&known(&[r"D:\Epic Games\Foobar"]), &game),
+            "prefix of a name is not a parent"
+        );
+        assert!(!epic_knows(&known(&[r"D:\Epic Games\Bar"]), &game));
+    }
+
+    #[test]
+    fn steam_installdir_with_a_sub_path_covers_its_first_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("appmanifest_5.acf"),
+            r#""AppState"
+{
+	"appid"	"5"
+	"installdir"	"Suite\Game"
+}
+"#,
+        )
+        .unwrap();
+        let (dirs, _) = steam_library(dir.path()).unwrap();
+        assert!(dirs.contains("suite"), "{dirs:?}");
+    }
+
+    #[test]
+    fn only_folders_at_the_expected_depth_are_ever_offered() {
+        let mut b = Builder::default();
+        let root = b.add(NO_PARENT, r"C:\", Kind::Dir, 0, 0);
+        let users = b.add(root, "Users", Kind::Dir, 0, 0);
+        let bob = b.add(users, "bob", Kind::Dir, 0, 0);
+        let ad = b.add(bob, "AppData", Kind::Dir, 0, 0);
+        let local = b.add(ad, "Local", Kind::Dir, 0, 0);
+        let leftover = b.add(local, "Leftover", Kind::Dir, 0, 0);
+        let deeper = b.add(leftover, "Deeper", Kind::Dir, 0, 0);
+        let games = b.add(root, "Games", Kind::Dir, 0, 0);
+        let epic = b.add(games, "Epic Games", Kind::Dir, 0, 0);
+        let game = b.add(epic, "Game", Kind::Dir, 0, 0);
+        let tree = b.finish();
+        assert!(allowed_depth(&tree, leftover));
+        assert!(allowed_depth(&tree, game));
+        for id in [root, users, bob, ad, local, deeper, games, epic] {
+            assert!(!allowed_depth(&tree, id), "{}", tree.name(id));
+        }
     }
 }

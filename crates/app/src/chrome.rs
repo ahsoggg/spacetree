@@ -125,6 +125,19 @@ impl App {
                         self.search_edited = Some(std::time::Instant::now());
                         self.tab = Tab::Overview;
                     }
+                    if self.settings.ai_enabled
+                        && ui
+                            .add_enabled(
+                                !self.ai.busy() && !self.search.trim().is_empty(),
+                                egui::Button::new("✨ Словами"),
+                            )
+                            .on_hover_text(
+                                "Найти по описанию, например: «архивы и установщики больше 500 МБ, которым больше полугода, кроме папки games»",
+                            )
+                            .clicked()
+                    {
+                        self.ai_search(self.search.clone());
+                    }
                     if ui.input(|i| i.modifiers.command && i.key_pressed(Key::F)) {
                         resp.request_focus();
                     }
@@ -591,6 +604,61 @@ impl App {
                     self.settings.save_snapshots = snaps;
                     self.settings.save();
                 }
+
+                ui.add_space(8.0);
+                ui.heading("ИИ-помощник (необязательно)");
+                let mut ai_on = self.settings.ai_enabled;
+                if ui
+                    .checkbox(&mut ai_on, "Включить подсказки ИИ через локальную Ollama")
+                    .on_hover_text("«Что это за папка?», поиск словами, разбор «Что выросло»")
+                    .changed()
+                {
+                    self.settings.ai_enabled = ai_on;
+                    self.settings.save();
+                }
+                if self.settings.ai_enabled {
+                    let mut cloud = self.settings.ai_claude;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut cloud, false, "Ollama (локально)");
+                        ui.selectable_value(&mut cloud, true, "Claude Code (облако)");
+                    });
+                    if cloud != self.settings.ai_claude {
+                        self.settings.ai_claude = cloud;
+                        self.settings.save();
+                    }
+                }
+                if self.settings.ai_enabled && self.settings.ai_claude {
+                    ui.colored_label(
+                        theme::REVIEW,
+                        "Имена папок и файлов, размеры и даты будут отправлены в Anthropic через ваш установленный Claude Code (claude -p, по вашей подписке). Инструменты и доступ к диску у него отключены.",
+                    );
+                } else if self.settings.ai_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Модель:");
+                        let hint = egui::TextEdit::singleline(&mut self.settings.ai_model).hint_text("например qwen2.5:7b");
+                        if ui.add(hint).lost_focus() {
+                            self.settings.save();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Адрес:");
+                        if ui.text_edit_singleline(&mut self.settings.ai_url).lost_focus() {
+                            self.settings.save();
+                        }
+                    });
+                    if !crate::ai::is_local_url(&self.settings.ai_url) {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            "Адрес должен быть локальным (http://127.0.0.1:…): на другие адреса запросы не отправляются.",
+                        );
+                    }
+                }
+                ui.label(
+                    RichText::new(
+                        "По умолчанию выключено. Модели передаются только имена папок и файлов, размеры и даты — не содержимое — и только на этот компьютер: другие адреса программа не принимает.",
+                    )
+                    .weak(),
+                );
 
                 ui.add_space(8.0);
                 ui.heading("Диагностика");

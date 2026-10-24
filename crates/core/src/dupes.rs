@@ -130,7 +130,10 @@ fn hash_file(path: &Path, size: u64, part: Part, progress: &DupProgress) -> Opti
 
 /// Byte-by-byte comparison; stops at the first difference.
 pub fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
-    let (mut fa, mut fb) = (File::open(a)?, File::open(b)?);
+    same_handles(&mut File::open(a)?, &mut File::open(b)?)
+}
+
+fn same_handles(fa: &mut File, fb: &mut File) -> io::Result<bool> {
     if fa.metadata()?.len() != fb.metadata()?.len() {
         return Ok(false);
     }
@@ -147,17 +150,87 @@ pub fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
     }
 }
 
-/// Replaces `dup` by a hard link to `keep`: both names stay, one copy of the data remains on disk.
-/// The content is compared again first (the files may have changed since the search). The link is created
-/// beside `dup` and renamed over it, so `dup` is never missing. Same NTFS volume only.
-pub fn replace_with_hardlink(keep: &Path, dup: &Path) -> io::Result<()> {
-    if !same_content(keep, dup)? {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "содержимое файлов изменилось"));
+/// Extensions of files that are written to in place. Two names of one hard-linked file are one file: a program
+/// that saves its database, log or settings through its own name changes the other program's copy too.
+/// Only formats that nobody edits in place are linked (see [`hardlink_allowed`]).
+const IMMUTABLE_EXT: &[&str] = &[
+    // code and packages
+    "dll", "exe", "sys", "so", "dylib", "lib", "pdb", "obj", "rlib", "jar", "whl", "nupkg", "msi", "cab", "mui",
+    // game and application assets
+    "pak", "ucas", "utoc", "bsa", "ba2", "vpk", "wad", "pck", "assets", "bundle", "resource", "ress",
+    // media
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "ttf", "otf", "woff", "woff2", "mp3", "flac", "ogg",
+    "wav", "mp4", "mkv", "avi", "mov", "webm", "pdf", "iso", // archives
+    "zip", "7z", "rar", "gz", "xz", "bz2", "zst", "tar", "tgz",
+];
+
+/// Whether `path` may be turned into a hard link: its extension is on the immutable list.
+pub fn hardlink_allowed(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMMUTABLE_EXT.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// Opens `path` for reading so that nobody can write to or delete it while the handle lives.
+fn open_locked(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
     }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
+fn stamp(f: &File) -> io::Result<(u64, Option<std::time::SystemTime>)> {
+    let m = f.metadata()?;
+    Ok((m.len(), m.modified().ok()))
+}
+
+/// Replaces `dup` by a hard link to `keep`: both names stay, one copy of the data remains on disk.
+/// Refused for formats that programs rewrite in place (databases, logs, settings), for a file somebody has
+/// open for writing, and for content that changed since the search. Both files are held open without write
+/// sharing while they are compared; the link is created beside `dup` under a temporary name, `dup` is checked
+/// once more (unchanged size and time) and the link is renamed over it, so `dup` is never missing. Same NTFS
+/// volume only.
+pub fn replace_with_hardlink(keep: &Path, dup: &Path) -> io::Result<()> {
+    if !hardlink_allowed(keep) || !hardlink_allowed(dup) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "этот тип файла программы изменяют на месте — общая копия испортила бы чужие данные",
+        ));
+    }
+    let seen = {
+        let (mut fk, mut fd) = (open_locked(keep)?, open_locked(dup)?);
+        let before = stamp(&fd)?;
+        if !same_handles(&mut fk, &mut fd)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "содержимое файлов изменилось",
+            ));
+        }
+        before
+    };
     let mut tmp = dup.as_os_str().to_owned();
     tmp.push(".spacetree-link");
     let tmp = PathBuf::from(tmp);
     std::fs::hard_link(keep, &tmp)?;
+    // The handles are closed here (a rename over an open file fails); a writer that sneaked in changed the
+    // size or the modification time.
+    let unchanged = open_locked(dup).and_then(|f| stamp(&f)).is_ok_and(|now| now == seen);
+    if !unchanged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "файл изменился во время замены",
+        ));
+    }
     std::fs::rename(&tmp, dup).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
@@ -276,7 +349,11 @@ mod tests {
     #[test]
     fn hardlink_replaces_copy_only_when_content_matches() {
         let dir = tempfile::tempdir().unwrap();
-        let (keep, dup, other) = (dir.path().join("k"), dir.path().join("d"), dir.path().join("o"));
+        let (keep, dup, other) = (
+            dir.path().join("k.pak"),
+            dir.path().join("d.pak"),
+            dir.path().join("o.pak"),
+        );
         std::fs::write(&keep, vec![1u8; 3 << 20]).unwrap();
         std::fs::write(&dup, vec![1u8; 3 << 20]).unwrap();
         std::fs::write(&other, vec![2u8; 3 << 20]).unwrap();
@@ -286,8 +363,42 @@ mod tests {
 
         replace_with_hardlink(&keep, &dup).unwrap();
         std::fs::write(&keep, b"changed").unwrap();
-        assert_eq!(std::fs::read(&dup).unwrap(), b"changed", "dup now shares the data of keep");
-        assert!(!dir.path().join("d.spacetree-link").exists());
+        assert_eq!(
+            std::fs::read(&dup).unwrap(),
+            b"changed",
+            "dup now shares the data of keep"
+        );
+        assert!(!dir.path().join("d.pak.spacetree-link").exists());
+    }
+
+    #[test]
+    fn mutable_formats_are_never_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "a.db", "a.sqlite", "a.log", "a.ini", "a.json", "a.cfg", "a.sav", "noext",
+        ] {
+            let (keep, dup) = (dir.path().join(name), dir.path().join(format!("copy-{name}")));
+            std::fs::write(&keep, b"same").unwrap();
+            std::fs::write(&dup, b"same").unwrap();
+            assert!(!hardlink_allowed(&keep), "{name}");
+            assert!(replace_with_hardlink(&keep, &dup).is_err(), "{name}");
+            std::fs::write(&keep, b"changed").unwrap();
+            assert_eq!(std::fs::read(&dup).unwrap(), b"same", "{name} must stay independent");
+        }
+        assert!(hardlink_allowed(Path::new("x.DLL")));
+    }
+
+    /// A file somebody has open for writing is not touched.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_open_for_writing_is_not_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keep, dup) = (dir.path().join("k.zip"), dir.path().join("d.zip"));
+        std::fs::write(&keep, b"same").unwrap();
+        std::fs::write(&dup, b"same").unwrap();
+        let _writer = std::fs::OpenOptions::new().write(true).open(&dup).unwrap();
+        assert!(replace_with_hardlink(&keep, &dup).is_err());
+        assert!(!dir.path().join("d.zip.spacetree-link").exists());
     }
 
     /// `a.` must be hashed as itself: through a Win32 path it would read its neighbour `a`, and a unique file

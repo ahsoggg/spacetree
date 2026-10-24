@@ -182,6 +182,15 @@ impl App {
         if let Some(i) = chosen {
             self.growth.choose(i, current);
         }
+        if self.settings.ai_enabled
+            && !self.growth.changes.is_empty()
+            && ui
+                .add_enabled(!self.ai.busy(), egui::Button::new("✨ Объяснить, что выросло"))
+                .on_hover_text("Локальная модель назовёт вероятных виновников по списку ниже")
+                .clicked()
+        {
+            self.ai_explain_growth();
+        }
         ui.add_space(8.0);
 
         let g = &self.growth;

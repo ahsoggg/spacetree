@@ -35,6 +35,13 @@ pub struct Settings {
     pub save_snapshots: bool,
     /// Follow changes on disk while the program is open (NTFS change journal; MFT scans only).
     pub live_monitor: bool,
+    /// AI helper (`ai.rs`). Off until the user turns it on; talks to a local Ollama only.
+    pub ai_enabled: bool,
+    pub ai_url: String,
+    pub ai_model: String,
+    /// Use Claude Code (`claude -p`, the user's subscription) instead of Ollama. Sends names, sizes and dates
+    /// to Anthropic, so it is a separate, explicit switch; off by default.
+    pub ai_claude: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +54,10 @@ impl Default for Settings {
             confirm_delete: true,
             save_snapshots: true,
             live_monitor: false,
+            ai_enabled: false,
+            ai_url: crate::ai::DEFAULT_URL.to_owned(),
+            ai_model: String::new(),
+            ai_claude: false,
         }
     }
 }
@@ -132,6 +143,17 @@ mod tests {
         assert!(!s.auto_update);
         let (s, corrupt) = Settings::parse(Some(b"\0\0garbage"));
         assert!(corrupt && !s.auto_update);
+    }
+
+    #[test]
+    fn the_ai_helper_is_off_by_default_and_after_damage() {
+        assert!(!Settings::parse(None).0.ai_enabled);
+        assert!(!Settings::parse(Some(br#"{"auto_update":true}"#)).0.ai_enabled);
+        assert!(!Settings::parse(Some(b"garbage")).0.ai_enabled);
+        assert!(
+            !Settings::parse(Some(br#"{"ai_enabled":true}"#)).0.ai_claude,
+            "cloud is its own opt-in"
+        );
     }
 
     #[test]
