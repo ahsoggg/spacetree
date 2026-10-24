@@ -4,7 +4,9 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Publish   # build + gh release create
 #
 # Assets: SpaceTree-Setup.exe (installer), SpaceTree.exe (portable; also what the auto-updater downloads),
-# SpaceTree.exe.sha256 (checked by the updater), spacetree-cli.exe.
+# SpaceTree.exe.sha256 + SpaceTree.exe.sig (both checked by the updater; the Ed25519 signature is what
+# authenticates the exe, made with %USERPROFILE%\.spacetree\release.key from scripts\make_release_key.ps1),
+# spacetree-cli.exe.
 param([switch]$Publish, [string]$NotesFile = "")
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +38,17 @@ if ($hasCert) {
 Copy-Item (Join-Path $dist "SpaceTree.exe") (Join-Path $dist "SpaceTree-Setup.exe")
 $hash = (Get-FileHash (Join-Path $dist "SpaceTree.exe") -Algorithm SHA256).Hash.ToLower()
 Set-Content -LiteralPath (Join-Path $dist "SpaceTree.exe.sha256") -Value "$hash  SpaceTree.exe" -NoNewline -Encoding ascii
+# Ed25519 signature over (version, SHA-256 of SpaceTree.exe); the updater refuses a release without a valid one.
+$keyFile = Join-Path $env:USERPROFILE ".spacetree\release.key"
+if (Test-Path $keyFile) {
+    $sig = cargo run -q --release -p spacetree-app --example release_sign -- sign $keyFile $version (Join-Path $dist "SpaceTree.exe")
+    if ($LASTEXITCODE -ne 0) { throw "signing failed" }
+    Set-Content -LiteralPath (Join-Path $dist "SpaceTree.exe.sig") -Value $sig -NoNewline -Encoding ascii
+} elseif ($Publish) {
+    throw "release signing key $keyFile not found (run scripts\make_release_key.ps1) - installed copies would reject the update"
+} else {
+    Write-Warning "release signing key not found - no SpaceTree.exe.sig (updater would reject this build)"
+}
 Get-ChildItem $dist | Format-Table Name, Length
 
 if ($Publish) {

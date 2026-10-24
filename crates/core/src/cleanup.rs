@@ -50,10 +50,12 @@ pub enum Category {
     OldDownloads,
     Duplicates,
     BigOld,
+    OrphanedData,
+    OrphanedGames,
 }
 
 impl Category {
-    pub const ALL: [Category; 20] = [
+    pub const ALL: [Category; 22] = [
         Category::RecycleBin,
         Category::Temp,
         Category::BrowserCache,
@@ -74,6 +76,8 @@ impl Category {
         Category::OldDownloads,
         Category::Duplicates,
         Category::BigOld,
+        Category::OrphanedData,
+        Category::OrphanedGames,
     ];
 
     pub fn title(self) -> &'static str {
@@ -98,6 +102,8 @@ impl Category {
             Category::OldDownloads => "Старые установщики и архивы в «Загрузках»",
             Category::Duplicates => "Дубликаты (одинаковое содержимое)",
             Category::BigOld => "Крупные файлы, не менявшиеся больше года",
+            Category::OrphanedData => "Осиротевшие данные программ (Orphaned)",
+            Category::OrphanedGames => "Остатки игр Steam и Epic Games (Orphaned)",
         }
     }
 
@@ -145,6 +151,12 @@ impl Category {
                 "Файлы от 1 МБ с полностью совпадающим содержимым (проверено по хешу). Самая новая копия сюда не входит — наведите курсор на строку, чтобы увидеть, какая оставлена."
             }
             Category::BigOld => "Файлы от 1 ГБ без изменений больше года (кроме системных папок). Решайте сами.",
+            Category::OrphanedData => {
+                "Папки в AppData от 50 МБ, имя которых не совпадает ни с одной установленной программой (реестр, Program Files). Возможно, программа уже удалена — но это догадка по названию: портативные программы и папки, названные по издателю, тоже могут попасть сюда."
+            }
+            Category::OrphanedGames => {
+                "Папки игр, о которых Steam или Epic Games Launcher больше не знает (нет манифеста установки), и остатки Proton/шейдеров удалённых игр Steam. Убедитесь, что игра не установлена вручную."
+            }
         }
     }
 
@@ -169,7 +181,9 @@ impl Category {
             | Category::Backups
             | Category::OldDownloads
             | Category::Duplicates
-            | Category::BigOld => Safety::Review,
+            | Category::BigOld
+            | Category::OrphanedData
+            | Category::OrphanedGames => Safety::Review,
         }
     }
 }

@@ -1,20 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod chrome;
+mod compress;
 mod delete;
 mod demo;
 mod diag;
 mod growth;
 mod installer;
+mod live;
+mod programs;
 mod recover;
+mod release_sig;
 mod settings;
+mod streams;
 mod theme;
 mod treemap;
 mod update;
 mod views;
 mod winint;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
@@ -23,6 +28,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Key, Rect, Ui};
 use spacetree_core::cleanup::{self, Group};
 use spacetree_core::dupes::{self, DupProgress, DupSet};
+use spacetree_core::orphans::{self, Installed};
 use spacetree_core::snapshot::{self, Entry, Snapshot};
 use spacetree_core::stats::{TypeStat, top_files, type_stats};
 use spacetree_core::{Backend, NodeId, Progress, ROOT, ScanError, ScanOutput, Tree, Used, export};
@@ -53,22 +59,50 @@ pub struct Loaded {
     pub disk: Option<(u64, u64)>,
     pub analysis: Duration,
     pub root_path: PathBuf,
+    /// Programs installed on this computer (for the "orphaned data" check).
+    pub installed: Arc<Installed>,
+    /// Files with a large hidden alternate data stream -> hidden bytes in total.
+    pub ads: HashMap<NodeId, u64>,
+    /// Folders that contain such files (for the treemap highlight).
+    pub ads_dirs: HashSet<NodeId>,
 }
 
 impl Loaded {
     /// Recomputes the derived lists after the tree changed (deletions).
     pub fn reanalyze(&mut self) {
         let tree = &self.out.tree;
-        let ((top, types), (groups, candidates)) = rayon::join(
+        let ((top, types), (mut groups, candidates)) = rayon::join(
             || rayon::join(|| top_files(tree, TOP_N), || type_stats(tree, ROOT)),
             || cleanup::find_with_dup_candidates(tree, now_unix()),
         );
+        let claimed: Vec<NodeId> = groups.iter().flat_map(|g| g.items.iter().copied()).collect();
+        groups.extend(orphans::find(tree, &self.installed, &claimed));
+        cleanup::sort_groups(&mut groups);
         self.cleanup = groups;
         self.dup_candidates = candidates;
         self.top = top;
         self.types = types;
         self.disk = spacetree_core::disk_space(&self.root_path);
         self.merge_dups();
+    }
+
+    /// Fills `ads` / `ads_dirs` from the scan's alternate data streams.
+    pub fn index_streams(&mut self) {
+        let tree = &self.out.tree;
+        self.ads.clear();
+        self.ads_dirs.clear();
+        for s in &self.out.streams {
+            *self.ads.entry(s.node).or_default() += s.size.max(s.alloc);
+        }
+        for &n in self.ads.keys() {
+            let mut cur = tree.parent(n);
+            while let Some(p) = cur {
+                if !self.ads_dirs.insert(p) {
+                    break; // the rest of the way up is already marked
+                }
+                cur = tree.parent(p);
+            }
+        }
     }
 
     /// (Re)builds the "duplicates" group from `dup_sets` and refreshes the total.
@@ -114,6 +148,8 @@ pub enum Tab {
     Top,
     Growth,
     Cleanup,
+    /// NTFS alternate data streams (MFT scans only).
+    Streams,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -151,6 +187,12 @@ pub struct TmCache {
     pub exts: Vec<String>,
 }
 
+/// Live update of the treemap: tiles glide from where they were to where the new layout puts them.
+pub struct TmMorph {
+    pub start: Instant,
+    pub from: HashMap<NodeId, Rect>,
+}
+
 /// Zoom transition of the treemap: the new layout grows from `from` (local coordinates) to the full area.
 pub struct TmAnim {
     pub from: Rect,
@@ -173,6 +215,8 @@ pub enum Action {
     Open(NodeId),
     CopyPath(NodeId),
     Delete(NodeId, bool),
+    /// Compress (`false`) or decompress (`true`) with LZX.
+    Compress(NodeId, bool),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -230,6 +274,7 @@ pub struct App {
     pub scroll_to: Option<usize>,
     pub tm: Option<TmCache>,
     pub tm_anim: Option<TmAnim>,
+    pub tm_morph: Option<TmMorph>,
     pub tm_menu: Option<NodeId>,
     pub highlight_ext: Option<String>,
     pub sort: SortKey,
@@ -252,6 +297,11 @@ pub struct App {
     /// Items ticked for deletion in the cleanup tab.
     pub marked: HashSet<NodeId>,
     pub delete: delete::DeleteState,
+    pub compress: compress::CompressState,
+    pub live: live::Live,
+    /// Start live monitoring as soon as the next scan is shown (it needs the egui context).
+    live_autostart: bool,
+    pub streams: streams::StreamsState,
     pub growth: growth::Growth,
     pub recover: recover::Recover,
     dup_job: Option<DupJob>,
@@ -391,6 +441,7 @@ impl App {
             scroll_to: None,
             tm: None,
             tm_anim: None,
+            tm_morph: None,
             tm_menu: None,
             highlight_ext: None,
             sort: SortKey::Size,
@@ -410,6 +461,10 @@ impl App {
             cleanup_by_size: false,
             marked: HashSet::new(),
             delete: delete::DeleteState::default(),
+            compress: compress::CompressState::default(),
+            live: live::Live::default(),
+            live_autostart: false,
+            streams: streams::StreamsState::default(),
             growth: growth::Growth::default(),
             recover: recover::Recover::default(),
             dup_job: None,
@@ -508,8 +563,8 @@ impl App {
         if self.job.is_some() {
             return;
         }
-        if !self.delete.idle() {
-            self.toast("Сначала дождитесь окончания удаления", ToastKind::Info);
+        if !self.delete.idle() || !self.compress.idle() {
+            self.toast("Сначала дождитесь окончания удаления или сжатия", ToastKind::Info);
             return;
         }
         if settings::is_demo() {
@@ -528,6 +583,7 @@ impl App {
         let (tx, rx) = channel();
         let (p, ctx2) = (progress.clone(), ctx.clone());
         std::thread::spawn(move || {
+            let installed = Arc::new(Installed::new(programs::installed_names()));
             let res = spacetree_core::scan(&path, backend, &p).map(|out| {
                 let t = Instant::now();
                 let snapshot = Snapshot::from_tree(&out.tree, now_unix() as u64);
@@ -546,7 +602,11 @@ impl App {
                     disk: None,
                     analysis: Duration::ZERO,
                     root_path: path,
+                    installed,
+                    ads: HashMap::new(),
+                    ads_dirs: HashSet::new(),
                 };
+                l.index_streams();
                 l.reanalyze();
                 l.analysis = t.elapsed();
                 l
@@ -621,6 +681,11 @@ impl App {
         self.generation += 1;
         self.scans += 1;
         self.delete.tree_replaced();
+        self.compress.tree_replaced();
+        self.stop_live();
+        self.tree_replaced_streams();
+        self.live_autostart = self.settings.live_monitor;
+        self.tm_morph = None;
         self.selected = None;
         self.tm_root = ROOT;
         self.tm = None;
@@ -825,6 +890,7 @@ impl App {
                 self.toast("Путь скопирован", ToastKind::Info);
             }
             Action::Delete(id, permanent) => self.request_delete(vec![id], permanent),
+            Action::Compress(id, undo) => self.request_compress(id, undo),
         }
     }
 
@@ -899,6 +965,11 @@ impl App {
         let ctx = ui.ctx().clone();
         self.poll_job();
         self.poll_delete();
+        self.poll_compress();
+        if std::mem::take(&mut self.live_autostart) {
+            self.start_live(&ctx);
+        }
+        self.poll_live(&ctx);
         self.poll_dups();
         self.poll_update();
         self.demo_step(&ctx);
@@ -971,9 +1042,14 @@ impl App {
                     }
                     egui::CentralPanel::default().show(ui, |ui| self.cleanup_view(ui));
                 }
+                Tab::Streams => {
+                    egui::CentralPanel::default().show(ui, |ui| self.streams_view(ui));
+                }
             }
         }
         self.delete_dialogs(&ctx);
+        self.compress_dialogs(&ctx);
+        self.stream_dialogs(&ctx);
         self.recover_window(&ctx);
         self.settings_window(&ctx);
         self.draw_toasts(&ctx);

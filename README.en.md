@@ -35,9 +35,20 @@ per-type statistics, search, and hints about what is safe to delete — plus a h
   to another drive.
 - **Deleting from the app** (`Del` → recycle bin, `Shift+Del` → permanent) with confirmation; the tree and
   statistics update instantly, no rescan.
+- **Hard links instead of deleting duplicates:** "Схлопнуть в жёсткие ссылки" (collapse into hard links) in the cleanup tab
+  keeps every name in place but stores the data once (NTFS, same volume).
+- **LZX compression (Windows Compact)** from the folder / file context menu: NTFS's built-in transparent compression,
+  usually −30…50 % on programs, games and assets; programs run as before. Never follows junctions or symlinks;
+  "remove compression" undoes it.
+- **Hidden NTFS streams (ADS):** a tab and pink highlight on the map for files with megabytes or gigabytes hidden in
+  `file.txt:name` that Explorer cannot see. A single stream can be deleted (MFT scan, administrator rights).
+- **Live mode:** the "Live" switch at the bottom follows the NTFS change journal (USN) — the map glides to its new
+  layout when something starts writing gigabytes (MFT scan of a whole drive, administrator rights).
+- **Orphaned data:** `AppData` folders without an installed program and leftovers of removed Steam / Epic Games games —
+  separate "review" groups in the cleanup tab; a guess from names, nothing is ticked for you.
 - Search by name (`Ctrl+F`), largest files, file types, CSV export, recent paths, arrow-key navigation,
   `F5` to rescan.
-- **Auto-update** from GitHub Releases with SHA-256 verification (can be turned off).
+- **Auto-update** from GitHub Releases with SHA-256 and Ed25519 signature verification (can be turned off).
 - **Diagnostics for bug reports:** an error log and a crash report written locally (see below).
 
 | What grew | Duplicates by content |

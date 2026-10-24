@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::error::ScanError;
+use crate::ntfs::StreamInfo;
 use crate::progress::Progress;
 use crate::tree::Tree;
 
@@ -49,6 +50,13 @@ pub struct ScanOutput {
     pub timings: Timings,
     /// Backend remarks for diagnostics (what was skipped, read speed, ...).
     pub notes: Vec<String>,
+    /// Large alternate data streams, biggest first (MFT only: they are invisible to a directory walk).
+    pub streams: Vec<StreamInfo>,
+    /// MFT record number -> node id, `NO_NODE` for records without a node (MFT only; empty for a walk). Lets
+    /// the USN journal monitor find the node of a changed file.
+    pub record_nodes: Vec<u32>,
+    /// Journal position at the start of an MFT scan.
+    pub usn: Option<crate::ntfs::UsnPos>,
 }
 
 /// Drive letter if `path` is a bare volume root (`C:`, `C:\`, `\\?\C:\`).
@@ -121,6 +129,9 @@ pub fn scan(path: &Path, requested: Backend, progress: &Progress) -> Result<Scan
                 extra_links: 0,
                 timings: w.timings,
                 notes: Vec::new(),
+                streams: Vec::new(),
+                record_nodes: Vec::new(),
+                usn: None,
             })
         }
         Used::Mft => scan_mft(path, selection, progress, start),
@@ -140,6 +151,9 @@ fn scan_mft(path: &Path, selection: Selection, progress: &Progress, start: Insta
         extra_links: m.extra_links,
         timings: m.timings,
         notes: m.notes,
+        streams: m.streams,
+        record_nodes: m.record_nodes,
+        usn: m.usn,
     })
 }
 

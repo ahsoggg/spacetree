@@ -334,6 +334,138 @@ impl Tree {
         true
     }
 
+    /// Moves `id` to where it belongs among its siblings (size descending, then id) after its size changed.
+    fn resort_in_parent(&mut self, id: NodeId) {
+        let Some(p) = self.parent(id) else { return };
+        let nodes = &self.nodes;
+        let key = |c: NodeId| (std::cmp::Reverse(nodes[c as usize].size), c);
+        let s = self.child_start[p as usize] as usize;
+        let sib = &mut self.children[s..s + self.child_len[p as usize] as usize];
+        let Some(mut i) = sib.iter().position(|&c| c == id) else {
+            return;
+        };
+        while i > 0 && key(sib[i - 1]) > key(sib[i]) {
+            sib.swap(i, i - 1);
+            i -= 1;
+        }
+        while i + 1 < sib.len() && key(sib[i + 1]) < key(sib[i]) {
+            sib.swap(i, i + 1);
+            i += 1;
+        }
+    }
+
+    /// Adds `(size, alloc, files)` (wrapping, as everywhere else) to every ancestor starting at `from`, keeping
+    /// each of them in order among its siblings and `mtime` as the latest of the subtree.
+    fn bump_ancestors(&mut self, from: NodeId, size: u64, alloc: u64, files: u32, mtime: u32) {
+        let mut cur = from;
+        loop {
+            let nd = &mut self.nodes[cur as usize];
+            nd.size = nd.size.wrapping_add(size);
+            nd.alloc = nd.alloc.wrapping_add(alloc);
+            nd.files = nd.files.wrapping_add(files);
+            nd.mtime = nd.mtime.max(mtime);
+            self.resort_in_parent(cur);
+            let Some(p) = self.parent(cur) else { break };
+            cur = p;
+        }
+    }
+
+    /// A file that was already scanned changed size on disk (live monitoring). Directories and removed nodes are
+    /// left alone. Returns false when nothing was changed.
+    pub fn resize(&mut self, id: NodeId, size: u64, alloc: u64, mtime: u32) -> bool {
+        let nd = self.nodes[id as usize];
+        if nd.removed || nd.kind != Kind::File {
+            return false;
+        }
+        let Some(parent) = self.parent(id) else { return false };
+        {
+            let nd = &mut self.nodes[id as usize];
+            nd.size = size;
+            nd.alloc = alloc;
+            nd.mtime = nd.mtime.max(mtime);
+        }
+        self.resort_in_parent(id);
+        self.bump_ancestors(
+            parent,
+            size.wrapping_sub(nd.size),
+            alloc.wrapping_sub(nd.alloc),
+            0,
+            mtime,
+        );
+        true
+    }
+
+    /// Gives a node a new name (live monitoring: a rename within the same folder). The old name stays in the shared
+    /// name buffer, unreferenced. False for the root, removed nodes, empty or oversized names.
+    pub fn rename(&mut self, id: NodeId, name: &str) -> bool {
+        let fits = u32::try_from(self.names.len() + name.len()).is_ok() && u16::try_from(name.len()).is_ok();
+        if id == ROOT || self.nodes[id as usize].removed || name.is_empty() || !fits {
+            return false;
+        }
+        let off = self.names.len() as u32;
+        self.names.push_str(name);
+        let nd = &mut self.nodes[id as usize];
+        (nd.name_off, nd.name_len) = (off, name.len() as u16);
+        true
+    }
+
+    /// Adds a file or an (empty) folder that appeared after the scan. `None` when `parent` is not a live folder or
+    /// the tree cannot address more names.
+    pub fn insert(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        kind: Kind,
+        size: u64,
+        alloc: u64,
+        mtime: u32,
+    ) -> Option<NodeId> {
+        let p = self.nodes.get(parent as usize)?;
+        let fits = u32::try_from(self.names.len() + name.len()).is_ok()
+            && u16::try_from(name.len()).is_ok()
+            && self.nodes.len() < (u32::MAX - 1) as usize
+            && self.children.len() < (u32::MAX - 1) as usize;
+        if p.removed || p.kind != Kind::Dir || kind == Kind::Link || name.is_empty() || !fits {
+            return None;
+        }
+        let id = self.nodes.len() as u32;
+        let (size, alloc, files) = if kind == Kind::File {
+            (size, alloc, 1)
+        } else {
+            (0, 0, 0)
+        };
+        let mut node = Node::new(parent, self.names.len() as u32, name.len() as u16, kind, size, alloc);
+        (node.files, node.mtime) = (files, mtime);
+        self.names.push_str(name);
+        self.nodes.push(node);
+        // The CSR index has one spare slot (`child_start[len]`); the new node's empty block goes there.
+        let end = self.children.len() as u32;
+        self.child_start[id as usize] = end;
+        self.child_start.push(end);
+        self.child_len.push(0);
+        // The parent's block is copied to the end unless it already is the last one (a folder that keeps
+        // receiving files is moved once, then grows in place).
+        let (s, l) = (
+            self.child_start[parent as usize] as usize,
+            self.child_len[parent as usize] as usize,
+        );
+        if s + l == self.children.len() {
+            self.children.push(id);
+        } else {
+            let new_start = self.children.len() as u32;
+            self.children.extend_from_within(s..s + l);
+            self.children.push(id);
+            self.child_start[parent as usize] = new_start;
+        }
+        self.child_len[parent as usize] += 1;
+        if kind == Kind::Dir {
+            self.dir_count += 1;
+        }
+        self.resort_in_parent(id);
+        self.bump_ancestors(parent, size, alloc, files, mtime);
+        Some(id)
+    }
+
     pub fn is_dir(&self, id: NodeId) -> bool {
         self.nodes[id as usize].kind == Kind::Dir
     }
@@ -423,6 +555,124 @@ mod tests {
         assert_eq!(t.children(root), &[f2, d, lnk]);
         assert_eq!(t.children(d), &[f1, f3]);
         assert_eq!(t.path(f3), format!("root{0}d{0}b.txt", std::path::MAIN_SEPARATOR));
+    }
+
+    /// Directory totals equal the sum of the live children, siblings are in order, every live node is listed.
+    fn check_invariants(t: &Tree) {
+        let mut listed = vec![false; t.len()];
+        listed[ROOT as usize] = true;
+        for id in 0..t.len() as NodeId {
+            if t.is_removed(id) {
+                continue;
+            }
+            let ch = t.children(id);
+            for w in ch.windows(2) {
+                let k = |c: NodeId| (std::cmp::Reverse(t.node(c).size), c);
+                assert!(k(w[0]) < k(w[1]), "children of {id} out of order");
+            }
+            for &c in ch {
+                assert!(!t.is_removed(c) && t.parent(c) == Some(id));
+                listed[c as usize] = true;
+            }
+            if t.is_dir(id) {
+                let sum = |f: fn(&Node) -> u64| ch.iter().map(|&c| f(t.node(c))).sum::<u64>();
+                assert_eq!(t.node(id).size, sum(|n| n.size), "size of {id}");
+                assert_eq!(t.node(id).alloc, sum(|n| n.alloc), "alloc of {id}");
+                assert_eq!(
+                    u64::from(t.node(id).files),
+                    sum(|n| u64::from(n.files)),
+                    "files of {id}"
+                );
+            }
+        }
+        for id in 0..t.len() as NodeId {
+            assert_eq!(listed[id as usize], !t.is_removed(id), "node {id} listing");
+        }
+    }
+
+    #[test]
+    fn live_changes_keep_totals_and_order() {
+        let mut b = Builder::default();
+        let root = b.add(NO_PARENT, "r", Kind::Dir, 0, 0);
+        let mut dirs = vec![root];
+        for i in 0..6 {
+            dirs.push(b.add(dirs[i / 2], &format!("d{i}"), Kind::Dir, 0, 0));
+        }
+        let mut files = Vec::new();
+        for i in 0..40u64 {
+            files.push(b.add(
+                dirs[i as usize % dirs.len()],
+                &format!("f{i}"),
+                Kind::File,
+                i * 7 % 23,
+                i * 7 % 23,
+            ));
+        }
+        let mut t = b.finish();
+        check_invariants(&t);
+
+        let mut seed = 12345u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for step in 0..400 {
+            match rnd() % 4 {
+                0 | 1 => {
+                    let parent = dirs[rnd() % dirs.len()];
+                    if let Some(id) = t.insert(parent, &format!("n{step}"), Kind::File, (rnd() % 100) as u64, 4096, 5) {
+                        files.push(id);
+                    }
+                }
+                2 => {
+                    let f = files[rnd() % files.len()];
+                    t.resize(f, (rnd() % 200) as u64, 4096, 9);
+                }
+                _ => {
+                    let f = files[rnd() % files.len()];
+                    t.remove(f);
+                }
+            }
+            if step % 20 == 0 {
+                let id = t
+                    .insert(dirs[rnd() % dirs.len()], &format!("nd{step}"), Kind::Dir, 0, 0, 0)
+                    .unwrap();
+                dirs.push(id);
+            }
+            check_invariants(&t);
+        }
+    }
+
+    #[test]
+    fn rename_changes_only_the_name() {
+        let mut b = Builder::default();
+        let root = b.add(NO_PARENT, "r", Kind::Dir, 0, 0);
+        let f = b.add(root, "old.txt", Kind::File, 5, 5);
+        let mut t = b.finish();
+        assert!(t.rename(f, "ново.txt"));
+        assert_eq!(t.name(f), "ново.txt");
+        assert_eq!(t.node(f).size, 5);
+        assert_eq!(t.children(root), &[f]);
+        assert!(!t.rename(f, "") && !t.rename(root, "x"));
+        t.remove(f);
+        assert!(!t.rename(f, "again"));
+    }
+
+    #[test]
+    fn insert_rejects_bad_parents() {
+        let mut b = Builder::default();
+        let root = b.add(NO_PARENT, "r", Kind::Dir, 0, 0);
+        let f = b.add(root, "f", Kind::File, 1, 1);
+        let mut t = b.finish();
+        assert!(
+            t.insert(f, "x", Kind::File, 1, 1, 0).is_none(),
+            "a file is not a parent"
+        );
+        assert!(t.insert(root, "", Kind::File, 1, 1, 0).is_none());
+        assert!(!t.resize(root, 5, 5, 0), "folders are not resized directly");
+        t.remove(f);
+        assert!(t.insert(f, "x", Kind::File, 1, 1, 0).is_none());
+        assert!(!t.resize(f, 9, 9, 0), "removed");
     }
 
     #[test]

@@ -10,13 +10,16 @@ use spacetree_core::cleanup::{Category, Safety};
 use spacetree_core::stats::{extension, format_date, human_size};
 use spacetree_core::{Kind, NodeId, ROOT, Tree};
 
+use crate::streams::ADS_COLOR;
 use crate::theme::{self, ext_color, shade};
-use crate::{Action, App, ListSort, SortKey, Tab, TmAnim, TmCache, TypeSort, now_unix, sort_list, treemap};
+use crate::{Action, App, ListSort, SortKey, Tab, TmAnim, TmCache, TmMorph, TypeSort, now_unix, sort_list, treemap};
 
 pub(crate) const ROW_H: f32 = 22.0;
 const INDENT: f32 = 16.0;
 const CLEANUP_ITEMS: usize = 300;
 const ZOOM_SECS: f32 = 0.28;
+/// How long tiles glide to their places after a live update.
+const MORPH_SECS: f32 = 0.30;
 
 pub(crate) fn font() -> FontId {
     FontId::proportional(13.0)
@@ -24,6 +27,10 @@ pub(crate) fn font() -> FontId {
 
 fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
+    Rect::from_min_max(a.min.lerp(b.min, t), a.max.lerp(b.max, t))
 }
 
 /// Right-aligned cell text ending at `right`.
@@ -51,6 +58,15 @@ pub(crate) fn node_menu(ui: &mut Ui, tree: &Tree, id: NodeId, act: &mut Option<A
     item(ui, "Показать в Проводнике", Action::Reveal(id));
     item(ui, "Открыть", Action::Open(id));
     item(ui, "Копировать путь", Action::CopyPath(id));
+    if cfg!(windows) && id != ROOT && tree.node(id).kind != Kind::Link {
+        ui.separator();
+        item(
+            ui,
+            "Сжать алгоритмом LZX (Windows Compact)…",
+            Action::Compress(id, false),
+        );
+        item(ui, "Снять сжатие LZX…", Action::Compress(id, true));
+    }
     if id != ROOT {
         ui.separator();
         item(ui, "Удалить в корзину          Del", Action::Delete(id, false));
@@ -530,11 +546,38 @@ impl App {
             c.root != self.tm_root || c.size != area.size() || c.by_age != by_age || c.generation != self.generation
         });
         if stale {
-            if let Some(old) = self.tm.take()
-                && old.root != self.tm_root
-                && old.generation == self.generation
-            {
-                self.start_zoom(tree, &old, area.size());
+            if let Some(old) = self.tm.take() {
+                if old.root != self.tm_root && old.generation == self.generation {
+                    self.start_zoom(tree, &old, area.size());
+                } else if old.root == self.tm_root
+                    && old.size == area.size()
+                    && old.by_age == by_age
+                    && old.generation != self.generation
+                    && self.live.active()
+                {
+                    // live update: glide from what is on screen now (a morph in progress counts) to the new layout
+                    let prev = self.tm_morph.take();
+                    let prev_t = prev
+                        .as_ref()
+                        .map(|m| ease_out(m.start.elapsed().as_secs_f32() / MORPH_SECS));
+                    let from = old
+                        .rects
+                        .iter()
+                        .map(|r| {
+                            let shown = match (&prev, prev_t) {
+                                (Some(m), Some(t)) if t < 1.0 => {
+                                    m.from.get(&r.id).map_or(r.rect, |f| lerp_rect(*f, r.rect, t))
+                                }
+                                _ => r.rect,
+                            };
+                            (r.id, shown)
+                        })
+                        .collect();
+                    self.tm_morph = Some(TmMorph {
+                        start: Instant::now(),
+                        from,
+                    });
+                }
             }
             let rects = treemap::layout(tree, self.tm_root, Rect::from_min_size(Pos2::ZERO, area.size()));
             let exts: Vec<String> = rects
@@ -588,6 +631,7 @@ impl App {
             }
         };
         let animating = self.tm_anim.is_some();
+        let morphing = self.tm_morph.is_some();
         let (sx, sy) = (frame.width() / full.width(), frame.height() / full.height());
         let map = |r: Rect| {
             Rect::from_min_max(
@@ -596,6 +640,22 @@ impl App {
             )
         };
         let painter = painter.with_clip_rect(area);
+        let morph_t = self
+            .tm_morph
+            .as_ref()
+            .map(|m| ease_out(m.start.elapsed().as_secs_f32() / MORPH_SECS))
+            .filter(|&t| t < 1.0);
+        if morph_t.is_none() {
+            self.tm_morph = None;
+        }
+        let morph = self.tm_morph.as_ref().zip(morph_t);
+        // where a tile is drawn right now: gliding from its previous place during a live update
+        let shown = |r: &treemap::TmRect| -> Rect {
+            match morph {
+                Some((m, t)) => m.from.get(&r.id).map_or(r.rect, |f| lerp_rect(*f, r.rect, t)),
+                None => r.rect,
+            }
+        };
 
         let off = area.min.to_vec2();
         let hover = if animating {
@@ -610,13 +670,20 @@ impl App {
         let mut mesh = egui::Mesh::default();
         let mut labels: Vec<(Rect, NodeId, bool)> = Vec::new();
         let frame_col = Color32::from_gray(if ui.visuals().dark_mode { 70 } else { 150 });
+        // outlines go over the tiles: pink for hidden streams, white fading out for what just changed on disk
+        let mut outlines: Vec<(Rect, Stroke)> = Vec::new();
         for (k, r) in cache.rects.iter().enumerate() {
-            let rect = map(r.rect);
+            let rect = map(shown(r));
             if !rect.intersects(area) {
                 continue;
             }
             if r.nested {
-                painter.rect_stroke(rect, 0.0, Stroke::new(1.0, frame_col), StrokeKind::Inside);
+                let stroke = if data.ads_dirs.contains(&r.id) {
+                    Stroke::new(1.5, ADS_COLOR)
+                } else {
+                    Stroke::new(1.0, frame_col)
+                };
+                painter.rect_stroke(rect, 0.0, stroke, StrokeKind::Inside);
                 if r.header {
                     labels.push((rect, r.id, true));
                 }
@@ -640,8 +707,21 @@ impl App {
             if rect.width() > 60.0 && rect.height() > 16.0 && !dim {
                 labels.push((rect, r.id, false));
             }
+            if data.ads.contains_key(&r.id) {
+                outlines.push((tr.shrink(0.5), Stroke::new(2.0, ADS_COLOR)));
+            }
+            if let Some(t) = self.live.recent.get(&r.id) {
+                let fade = 1.0 - t.elapsed().as_secs_f32() / crate::live::FLASH.as_secs_f32();
+                outlines.push((
+                    tr,
+                    Stroke::new(2.5, Color32::WHITE.gamma_multiply(fade.clamp(0.0, 1.0))),
+                ));
+            }
         }
         painter.add(Shape::mesh(mesh));
+        for (rect, stroke) in outlines {
+            painter.rect_stroke(rect, 0.0, stroke, StrokeKind::Inside);
+        }
         let folder_text = if ui.visuals().dark_mode {
             Color32::from_gray(210)
         } else {
@@ -667,10 +747,13 @@ impl App {
                 if let Some(id) = id
                     && let Some(r) = cache.rects.iter().find(|r| r.id == id)
                 {
-                    painter.rect_stroke(map(r.rect), 0.0, Stroke::new(2.0, c), StrokeKind::Inside);
+                    painter.rect_stroke(map(shown(r)), 0.0, Stroke::new(2.0, c), StrokeKind::Inside);
                 }
             }
         } else {
+            ui.ctx().request_repaint();
+        }
+        if morphing {
             ui.ctx().request_repaint();
         }
         if cache.rects.is_empty() {
@@ -727,6 +810,14 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
+            if !data.ads.is_empty() {
+                let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                ui.painter()
+                    .rect_stroke(r, 3.0, Stroke::new(2.0, ADS_COLOR), StrokeKind::Inside);
+                ui.label("скрытые потоки").on_hover_text(
+                    "Файлы со скрытыми NTFS-потоками и папки, где они лежат. Подробности — на вкладке «Скрытые потоки»",
+                );
+            }
             if by_age {
                 let now = now_unix();
                 for (label, days) in theme::AGE_LEGEND {
@@ -987,6 +1078,7 @@ impl App {
 
         let dup_progress = self.dup_progress();
         let mut dup_cmd = None; // Some(true) = start, Some(false) = cancel
+        let mut hardlink_all = false;
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1062,6 +1154,17 @@ impl App {
                         })
                         .weak(),
                     );
+                    if !sets.is_empty()
+                        && theme::primary_button(ui, "Схлопнуть в жёсткие ссылки (Hard Links)…")
+                            .on_hover_text(
+                                "Все лишние копии останутся на своих местах (ни одна программа не потеряет файл), \
+                                 но на диске будут храниться одним экземпляром: NTFS, один том. Освободится место \
+                                 лишних копий. Новейшая копия каждого набора остаётся как есть.",
+                            )
+                            .clicked()
+                    {
+                        hardlink_all = true;
+                    }
                     if ui.button("Искать заново").clicked() {
                         dup_cmd = Some(true);
                     }
@@ -1083,6 +1186,11 @@ impl App {
             Some(true) => self.start_dups(ui.ctx()),
             Some(false) => self.cancel_dups(),
             None => {}
+        }
+        if hardlink_all {
+            let mut ids: Vec<NodeId> = data.dup_keep.keys().copied().collect();
+            ids.sort_by_key(|&i| std::cmp::Reverse(tree.node(i).size));
+            self.request_hardlink(ids);
         }
         ui.add_space(8.0);
         if data.cleanup.is_empty() {

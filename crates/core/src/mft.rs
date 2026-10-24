@@ -45,6 +45,10 @@ pub struct MftOutput {
     pub extra_links: u64,
     pub timings: Timings,
     pub notes: Vec<String>,
+    pub streams: Vec<ntfs::StreamInfo>,
+    pub record_nodes: Vec<u32>,
+    /// Journal position when the scan began: the live monitor replays the changes made since.
+    pub usn: Option<ntfs::UsnPos>,
 }
 
 pub struct VolumeInfo {
@@ -136,7 +140,7 @@ pub(crate) fn read_virtual(file: &File, runs: &[Run], bpc: u64, mut voff: u64, b
 }
 
 pub(crate) fn data_extents(attr: &[u8]) -> Result<(Vec<Run>, u64), ScanError> {
-    if attr[8] == 0 || attr.len() < 0x40 {
+    if attr.len() < 0x40 || attr[8] == 0 {
         return Err(ScanError::Ntfs("$DATA файла $MFT резидентный".into()));
     }
     let start = u64::from_le_bytes(attr[0x10..0x18].try_into().unwrap());
@@ -161,7 +165,11 @@ pub(crate) fn mft_extents(file: &File, info: &VolumeInfo) -> Result<MftLayout, S
     let bpc = info.bytes_per_cluster;
     let rs = info.record_size;
     let mut block = vec![0u8; rs.max(4096)];
-    read_exact_at(file, &mut block, info.mft_start_lcn * bpc)?;
+    let rec0_at = info
+        .mft_start_lcn
+        .checked_mul(bpc)
+        .ok_or_else(|| ScanError::Ntfs("некорректные параметры тома".into()))?;
+    read_exact_at(file, &mut block, rec0_at)?;
     if !ntfs::apply_fixups(&mut block[..rs]) {
         return Err(ScanError::Ntfs("запись 0 ($MFT) повреждена".into()));
     }
@@ -270,6 +278,7 @@ fn used_ranges(bitmap: Option<&[u8]>, total: u64, gap: u64) -> Vec<(u64, u64)> {
 pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
     let t0 = Instant::now();
     let (file, info) = probe(drive)?;
+    let usn = winapi::usn_query(&file).ok();
     let (runs, real_size, bitmap) = mft_extents(&file, &info)?;
     let (bpc, rs) = (info.bytes_per_cluster, info.record_size);
     let total_records = real_size / rs as u64;
@@ -361,15 +370,25 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
     let timings: Timings = vec![
         ("экстенты $MFT и битовая карта", t_extents),
         ("чтение и разбор (конвейер)", t_pipeline),
-        ("  из них чтение (поток)", std::time::Duration::from_nanos(read_ns.load(Relaxed))),
-        ("  из них разбор (поток)", std::time::Duration::from_nanos(parse_ns.load(Relaxed))),
+        (
+            "  из них чтение (поток)",
+            std::time::Duration::from_nanos(read_ns.load(Relaxed)),
+        ),
+        (
+            "  из них разбор (поток)",
+            std::time::Duration::from_nanos(parse_ns.load(Relaxed)),
+        ),
         ("построение дерева", t2.elapsed()),
     ];
     let mb = |records: u64| (records * rs as u64) as f64 / 1e6;
     let read_s = read_ns.load(Relaxed) as f64 / 1e9;
     let notes = vec![format!(
         "битовая карта $MFT: {}; записей всего {total_records}, прочитано {to_read} ({:.0} МБ из {:.0} МБ), пропущено {}; чтение {:.0} МБ/с",
-        if bitmap.is_some() { "прочитана" } else { "НЕ прочитана — читаются все записи" },
+        if bitmap.is_some() {
+            "прочитана"
+        } else {
+            "НЕ прочитана — читаются все записи"
+        },
         mb(to_read),
         mb(total_records),
         total_records - to_read,
@@ -382,6 +401,9 @@ pub fn scan(drive: char, progress: &Progress) -> Result<MftOutput, ScanError> {
         error_samples: errors.into_inner().unwrap(),
         extra_links: built.extra_links,
         timings,
+        streams: built.streams,
+        record_nodes: built.record_nodes,
+        usn,
     })
 }
 

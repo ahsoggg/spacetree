@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Event, ViewportCommand};
 use spacetree_core::cleanup::Category;
 use spacetree_core::dupes::DupSet;
+use spacetree_core::orphans::Installed;
 use spacetree_core::snapshot::{Change, Entry, Snapshot};
 use spacetree_core::stats::{top_files, type_stats};
 use spacetree_core::tree::{Builder, Kind, NO_PARENT};
-use spacetree_core::{NodeId, ROOT, ScanOutput, Selection, Tree, Used};
+use spacetree_core::{NO_NODE, NodeId, ROOT, ScanOutput, Selection, StreamInfo, Tree, Used};
 
 use crate::growth::Growth;
 use crate::{App, DriveInfo, Loaded, TOP_N, Tab, now_unix};
@@ -38,14 +39,27 @@ pub fn drives() -> Vec<DriveInfo> {
 }
 
 /// What the screenshot tour does, in order.
-const STEPS: [&str; 7] = [
+const STEPS: [&str; 9] = [
     "welcome",
     "overview",
     "types",
     "growth",
     "cleanup",
     "duplicates",
+    "orphans",
+    "streams",
     "largest",
+];
+
+/// Programs "installed" on the invented computer (the folder of the removed one is left in AppData).
+const INSTALLED: [&str; 7] = [
+    "Google Chrome",
+    "Discord",
+    "Adobe Inc.",
+    "JetBrains",
+    "Docker Desktop",
+    "Git",
+    "Microsoft Office",
 ];
 
 pub struct Demo {
@@ -117,6 +131,7 @@ impl Maker {
 struct Fixture {
     tree: Tree,
     dup_sets: Vec<DupSet>,
+    streams: Vec<StreamInfo>,
     selected: NodeId,
 }
 
@@ -180,6 +195,8 @@ fn build() -> Fixture {
     let roaming = m.dir(appdata, "Roaming");
     let discord = m.path(roaming, "discord/Cache");
     m.spread(discord, "d", "cache", 10, 1100 * MB, (0, 15));
+    let leftover = m.dir(roaming, "ProSketch Studio");
+    m.spread(leftover, "brushcache", "db", 8, 3 * GB + 400 * MB, (200, 700));
 
     let downloads = m.dir(me, "Downloads");
     m.file(downloads, "VisualStudioSetup.exe", 1700 * MB, 140);
@@ -189,6 +206,7 @@ fn build() -> Fixture {
     m.file(downloads, "photos-from-trip.zip", 2 * GB, 60);
     let dl_holiday = m.file(downloads, "Holiday 2024 (1).mp4", 4 * GB + 200 * MB, 40);
     m.file(downloads, "invoice.pdf", 2 * MB, 3);
+    let readme = m.file(downloads, "readme.txt", 1024, 200);
 
     let videos = m.dir(me, "Videos");
     let holiday = m.file(videos, "Holiday 2024.mp4", 4 * GB + 200 * MB, 12);
@@ -207,6 +225,7 @@ fn build() -> Fixture {
     let scans = m.dir(pics, "Scans");
     let scan_a = m.file(scans, "contract-scan.pdf", 38 * MB, 20);
     let docs = m.dir(me, "Documents");
+    let notes = m.file(docs, "meeting-notes.txt", 0, 30);
     let backup = m.dir(docs, "Backup");
     let scan_b = m.file(backup, "contract-scan.pdf", 38 * MB, 90);
     let backup_holiday = m.file(backup, "Holiday 2024.mp4", 4 * GB + 200 * MB, 70);
@@ -244,10 +263,25 @@ fn build() -> Fixture {
             items: vec![scan_a, scan_b],
         },
     ];
+    let streams = vec![
+        StreamInfo {
+            node: notes,
+            name: "backup.vhd".into(),
+            size: 6 * GB,
+            alloc: 6 * GB,
+        },
+        StreamInfo {
+            node: readme,
+            name: "payload.dat".into(),
+            size: GB + 200 * MB,
+            alloc: GB + 200 * MB,
+        },
+    ];
     let selected = find(&tree, "Users/demo/Videos").unwrap_or(ROOT);
     Fixture {
         tree,
         dup_sets,
+        streams,
         selected,
     }
 }
@@ -336,12 +370,19 @@ impl App {
                 extra_links: 0,
                 timings: Vec::new(),
                 notes: Vec::new(),
+                streams: fx.streams,
+                // non-empty: the demo behaves like an MFT scan (shows the hidden-streams tab)
+                record_nodes: vec![NO_NODE],
+                usn: None,
             },
             top,
             types,
             cleanup: Vec::new(),
             cleanup_total: 0,
             dup_candidates: Vec::new(),
+            installed: std::sync::Arc::new(Installed::new(INSTALLED.map(String::from))),
+            ads: Default::default(),
+            ads_dirs: Default::default(),
             dup_sets: Some(fx.dup_sets),
             dup_keep: Default::default(),
             snapshot: Some(snapshot),
@@ -350,6 +391,7 @@ impl App {
             analysis: Duration::from_millis(300),
             root_path: PathBuf::from("C:\\"),
         };
+        loaded.index_streams();
         loaded.reanalyze();
         // reanalyze looked at the real disk: show a plausible one for the invented computer instead
         loaded.disk = Some((512 * GB, 512 * GB - loaded.out.tree.root_stats().0 - 60 * GB));
@@ -383,6 +425,15 @@ impl App {
                 self.highlight_ext = Some("mp4".into());
             }
             "growth" => self.tab = Tab::Growth,
+            "streams" => self.tab = Tab::Streams,
+            "orphans" => {
+                self.tab = Tab::Cleanup;
+                self.cleanup_show = [false, false, true];
+                self.cleanup_open.clear();
+                if let Some(i) = cleanup_group(self, Category::OrphanedData) {
+                    self.cleanup_open.insert(i);
+                }
+            }
             "cleanup" => {
                 self.tab = Tab::Cleanup;
                 self.cleanup_show = [true; 3];

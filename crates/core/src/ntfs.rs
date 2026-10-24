@@ -101,11 +101,47 @@ pub struct ExtRec {
     pub alloc: u64,
 }
 
+/// A named `$DATA` stream (alternate data stream) of a file, as found in one record.
+#[derive(Clone, Copy, Debug)]
+pub struct RawStream {
+    /// Base record number of the file that owns the stream.
+    pub base: u32,
+    pub name_off: u32,
+    pub name_len: u16,
+    pub size: u64,
+    pub alloc: u64,
+}
+
 #[derive(Default)]
 pub struct ChunkOut {
     pub bases: Vec<BaseRec>,
     pub exts: Vec<ExtRec>,
     pub names: String,
+    /// Large alternate data streams (see [`ADS_MIN_SIZE`]); their names live in `stream_names`.
+    pub streams: Vec<RawStream>,
+    pub stream_names: String,
+}
+
+/// Alternate streams below this size are not collected: they are not worth a user's attention (`Zone.Identifier`
+/// and the like are a few dozen bytes) and a volume can hold millions of them.
+pub const ADS_MIN_SIZE: u64 = 1 << 20;
+/// Records below this number are NTFS metafiles (`$MFT`, `$Secure`, `$UsnJrnl`...) whose streams are system business.
+const FIRST_USER_RECORD: u32 = 24;
+/// The hidden backing store of NTFS "system compression" (WOF/CompactOS): large, legitimate, and already counted.
+const WOF_STREAM: &str = "WofCompressedData";
+
+/// A stream that is somebody's hidden data and not part of how NTFS itself works.
+pub fn is_user_stream(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('$') && name != WOF_STREAM
+}
+
+/// One alternate data stream of a file in the finished tree.
+#[derive(Clone, Debug)]
+pub struct StreamInfo {
+    pub node: crate::tree::NodeId,
+    pub name: String,
+    pub size: u64,
+    pub alloc: u64,
 }
 
 struct Found {
@@ -135,6 +171,7 @@ pub fn parse_record(buf: &mut [u8], rec_no: u32, out: &mut ChunkOut) {
     let used = (u32_at(buf, 0x18) as usize).min(buf.len());
     let mut off = u16_at(buf, 0x14) as usize;
 
+    let streams_before = out.streams.len();
     let mut f = Found {
         parent: 0,
         name_off: 0,
@@ -162,9 +199,21 @@ pub fn parse_record(buf: &mut [u8], rec_no: u32, out: &mut ChunkOut) {
             ATTR_STANDARD_INFORMATION if attr[8] == 0 => parse_standard_info(attr, &mut f),
             ATTR_FILE_NAME if attr[8] == 0 => parse_file_name(attr, out, &mut f),
             ATTR_DATA if attr[9] == 0 => parse_data(attr, &mut f),
+            ATTR_DATA => parse_named_stream(attr, rec_no, out),
             _ => {}
         }
         off += len;
+    }
+
+    if base_ref != 0 {
+        // streams of an extension record belong to the file named by its base record
+        for st in &mut out.streams[streams_before..] {
+            st.base = if base_ref <= u32::MAX as u64 {
+                base_ref as u32
+            } else {
+                u32::MAX
+            };
+        }
     }
 
     let mut bflags = 0;
@@ -249,28 +298,66 @@ fn parse_file_name(attr: &[u8], out: &mut ChunkOut, f: &mut Found) {
     f.has_name = true;
 }
 
-/// `attr` is an unnamed $DATA attribute.
-fn parse_data(attr: &[u8], f: &mut Found) {
+/// `(size, allocated)` of a $DATA attribute; `None` for a malformed one or a non-first extent (sizes are only
+/// valid in the extent that starts at VCN 0).
+fn data_sizes(attr: &[u8]) -> Option<(u64, u64)> {
     if attr[8] == 0 {
-        if attr.len() >= 0x18 && !f.has_data {
-            f.size = u32_at(attr, 0x10) as u64;
-            f.alloc = 0; // resident: stored inside the MFT record
-            f.has_data = true;
-        }
-        return;
+        // resident: stored inside the MFT record
+        return (attr.len() >= 0x18).then(|| (u32_at(attr, 0x10) as u64, 0));
     }
-    // Non-resident: sizes are only valid in the first extent (starting VCN 0).
-    if attr.len() < 0x40 || u64_at(attr, 0x10) != 0 || f.has_data {
-        return;
+    if attr.len() < 0x40 || u64_at(attr, 0x10) != 0 {
+        return None;
     }
     let aflags = u16_at(attr, 0x0C);
-    f.size = u64_at(attr, 0x30);
-    f.alloc = u64_at(attr, 0x28);
+    let mut alloc = u64_at(attr, 0x28);
     // Compressed/sparse streams carry the on-disk size at 0x40 (linux-ntfs ATTR_RECORD.compressed_size).
     if aflags & (ATTR_FLAG_COMPRESSED | ATTR_FLAG_SPARSE) != 0 && u16_at(attr, 0x22) != 0 && attr.len() >= 0x48 {
-        f.alloc = u64_at(attr, 0x40);
+        alloc = u64_at(attr, 0x40);
     }
-    f.has_data = true;
+    Some((u64_at(attr, 0x30), alloc))
+}
+
+/// `attr` is an unnamed $DATA attribute.
+fn parse_data(attr: &[u8], f: &mut Found) {
+    if f.has_data {
+        return;
+    }
+    if let Some((size, alloc)) = data_sizes(attr) {
+        (f.size, f.alloc, f.has_data) = (size, alloc, true);
+    }
+}
+
+/// `attr` is a named $DATA attribute (alternate data stream): kept when it is big enough to matter.
+fn parse_named_stream(attr: &[u8], rec_no: u32, out: &mut ChunkOut) {
+    if attr.len() < 0x18 || rec_no < FIRST_USER_RECORD {
+        return;
+    }
+    let (nchars, noff) = (attr[9] as usize, u16_at(attr, 0x0A) as usize);
+    let Some(raw) = attr.get(noff..noff + nchars * 2) else {
+        return;
+    };
+    let Some((size, alloc)) = data_sizes(attr).filter(|&(size, alloc)| size.max(alloc) >= ADS_MIN_SIZE) else {
+        return;
+    };
+    let units = raw.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes(*p));
+    let name: String = char::decode_utf16(units)
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    if !is_user_stream(&name) || name.len() > u16::MAX as usize {
+        return;
+    }
+    let name_off = out.stream_names.len();
+    if name_off + name.len() > u32::MAX as usize {
+        return;
+    }
+    out.stream_names.push_str(&name);
+    out.streams.push(RawStream {
+        base: rec_no,
+        name_off: name_off as u32,
+        name_len: name.len() as u16,
+        size,
+        alloc,
+    });
 }
 
 /// One extent of a non-resident attribute. `lcn == None` is a sparse run.
@@ -361,7 +448,23 @@ pub fn find_attr(rec: &[u8], ty: u32) -> Option<&[u8]> {
 pub struct Built {
     pub tree: Tree,
     pub extra_links: u64,
+    /// Large alternate data streams, biggest first.
+    pub streams: Vec<StreamInfo>,
+    /// MFT record number -> node id ([`NO_NODE`] for records that are not in the tree).
+    pub record_nodes: Vec<u32>,
 }
+
+/// A position in the NTFS change journal: which journal, and the sequence number where the next record goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UsnPos {
+    pub id: u64,
+    pub next_usn: i64,
+    /// Records before this one have been discarded from the journal.
+    pub lowest_valid_usn: i64,
+}
+
+/// Marks an MFT record that has no node in [`Built::record_nodes`].
+pub const NO_NODE: u32 = u32::MAX;
 
 const NONE: u32 = u32::MAX;
 const ORPHANS: &str = "[без родителя]";
@@ -371,6 +474,13 @@ pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanE
     // Sizes are known up front: the big vectors are allocated once instead of regrown (and copied) per chunk,
     // and the per-chunk name offsets are shifted in parallel.
     let mut chunks = chunks;
+    let mut raw_streams: Vec<(RawStream, String)> = Vec::new();
+    for c in &chunks {
+        for st in &c.streams {
+            let name = c.stream_names[st.name_off as usize..st.name_off as usize + st.name_len as usize].to_owned();
+            raw_streams.push((*st, name));
+        }
+    }
     let mut shifts = Vec::with_capacity(chunks.len());
     let (mut name_total, mut base_total, mut ext_total) = (0usize, 0usize, 0usize);
     for c in &chunks {
@@ -378,6 +488,10 @@ pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanE
         name_total += c.names.len();
         base_total += c.bases.len();
         ext_total += c.exts.len();
+    }
+    // Name offsets are u32: a forged $MFT full of long names must fail the scan, not wrap the offsets around.
+    if name_total > (u32::MAX as usize) - 64 || base_total > u32::MAX as usize - 2 {
+        return Err(ScanError::Ntfs("слишком много имён в $MFT".into()));
     }
     chunks.par_iter_mut().zip(shifts).for_each(|(c, shift)| {
         if shift != 0 {
@@ -445,7 +559,10 @@ pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanE
     nodes.push(Node::new(NO_PARENT, root_off, root_name.len() as u16, Kind::Dir, 0, 0));
     let orphan_id = order.len() as u32;
     let has_orphans = AtomicBool::new(false);
-    let extra_links: u64 = order[1..].par_iter().map(|&bi| bases[bi as usize].extra_links as u64).sum();
+    let extra_links: u64 = order[1..]
+        .par_iter()
+        .map(|&bi| bases[bi as usize].extra_links as u64)
+        .sum();
     nodes.par_extend(order[1..].par_iter().with_min_len(8192).map(|&bi| {
         let b = &bases[bi as usize];
         let is_dir = b.flags & B_DIR != 0;
@@ -470,9 +587,24 @@ pub fn build_tree(chunks: Vec<ChunkOut>, root_name: &str) -> Result<Built, ScanE
         nodes.push(Node::new(ROOT, orphan_off, ORPHANS.len() as u16, Kind::Dir, 0, 0));
     }
     debug_assert_eq!(ROOT, 0);
+    let mut streams: Vec<StreamInfo> = raw_streams
+        .into_iter()
+        .filter_map(|(st, name)| {
+            let node = node_of.get(st.base as usize).copied().filter(|&n| n != NONE)?;
+            (node != 0).then_some(StreamInfo {
+                node,
+                name,
+                size: st.size,
+                alloc: st.alloc,
+            })
+        })
+        .collect();
+    streams.sort_by_key(|s| (std::cmp::Reverse(s.size.max(s.alloc)), s.node));
     Ok(Built {
         tree: Tree::from_parts(nodes, names),
         extra_links,
+        streams,
+        record_nodes: node_of,
     })
 }
 
@@ -526,6 +658,24 @@ pub mod testutil {
             a[0x40..0x48].copy_from_slice(&c.to_le_bytes());
         }
         a.push(0); // empty run list
+        align8(&mut a);
+        let l = a.len() as u32;
+        a[4..8].copy_from_slice(&l.to_le_bytes());
+        a
+    }
+
+    /// A named non-resident $DATA attribute (alternate data stream).
+    pub fn named_data(name: &str, real: u64, alloc: u64) -> Vec<u8> {
+        let mut a = nonresident_data(real, alloc, 0, 0, None);
+        a.truncate(0x48);
+        let n = utf16(name);
+        a[9] = (n.len() / 2) as u8;
+        a[0x0A..0x0C].copy_from_slice(&0x48u16.to_le_bytes());
+        a.extend_from_slice(&n);
+        align8(&mut a);
+        let runs = a.len() as u16;
+        a[0x20..0x22].copy_from_slice(&runs.to_le_bytes());
+        a.push(0);
         align8(&mut a);
         let l = a.len() as u32;
         a[4..8].copy_from_slice(&l.to_le_bytes());
@@ -740,5 +890,42 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("LONGNA") || p.contains("deleted") || p.contains("a-link"))
         );
+    }
+
+    #[test]
+    fn big_alternate_streams_are_reported_and_system_ones_are_not() {
+        const MB: u64 = 1 << 20;
+        let mut recs: Vec<Vec<u8>> = (0..30).map(|_| vec![0u8; 1024]).collect();
+        recs[5] = record(0x03, 0, &[file_name_attr(5, ".", 1)]);
+        recs[25] = record(
+            0x01,
+            0,
+            &[
+                file_name_attr(5, "innocent.txt", 1),
+                resident(0x80, &[1u8; 3]),
+                named_data("hidden.bin", 50 * MB, 50 * MB),
+                named_data("Zone.Identifier", 26, 0),
+                named_data("small", MB - 1, MB - 1),
+                named_data("WofCompressedData", 9 * MB, 9 * MB),
+                named_data("$Bad", 7 * MB, 7 * MB),
+            ],
+        );
+        // a stream stored in an extension record of file 25
+        recs[26] = record(0x01, 25 | (1 << 48), &[named_data("more", 3 * MB, 3 * MB)]);
+        // metafile streams are ignored
+        recs[10] = record(
+            0x01,
+            0,
+            &[file_name_attr(5, "$UpCase", 1), named_data("big", 8 * MB, 8 * MB)],
+        );
+
+        let built = build_tree(parse_all(recs), "X:\\").unwrap();
+        let names: Vec<(&str, u64)> = built.streams.iter().map(|s| (s.name.as_str(), s.size)).collect();
+        assert_eq!(names, [("hidden.bin", 50 * MB), ("more", 3 * MB)]);
+        let t = &built.tree;
+        assert!(built.streams.iter().all(|s| t.name(s.node) == "innocent.txt"));
+        assert_eq!(t.root_stats().0, 3, "stream bytes are not part of the file size");
+        assert_eq!(built.record_nodes[25], built.streams[0].node);
+        assert_eq!(built.record_nodes[0], NO_NODE);
     }
 }

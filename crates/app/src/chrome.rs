@@ -178,13 +178,17 @@ impl App {
             Some(h) => format!("Что выросло · {h}"),
             None => "Что выросло".to_owned(),
         };
-        let tabs = [
+        let streams = format!("Скрытые потоки · {}", self.streams_left());
+        let mut tabs = vec![
             (Tab::Overview, "Обзор"),
             (Tab::Types, "Типы файлов"),
             (Tab::Top, "Крупнейшие файлы"),
             (Tab::Growth, growth.as_str()),
             (Tab::Cleanup, cleanup.as_str()),
         ];
+        if !data.out.record_nodes.is_empty() {
+            tabs.push((Tab::Streams, streams.as_str())); // only an MFT scan can see alternate data streams
+        }
         let mut active_rect = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 18.0;
@@ -220,6 +224,7 @@ impl App {
     }
 
     pub fn status_bar(&mut self, ui: &mut Ui) {
+        let mut toggle_live = false;
         ui.horizontal(|ui| {
             if let Some(d) = &self.data {
                 let (size, alloc, files) = d.out.tree.root_stats();
@@ -261,6 +266,27 @@ impl App {
                     ui.label(RichText::new(format!("{} · {}", d.out.tree.name(id), human_size(nd.size))).weak());
                 }
             }
+            if self.live_available() {
+                ui.separator();
+                let on = self.live.active();
+                let text = if on {
+                    RichText::new(format!("● Live · {}", self.live.applied)).color(theme::SAFE)
+                } else {
+                    RichText::new("○ Live").color(ui.visuals().weak_text_color())
+                };
+                let (events, dropped) = self.live.stats();
+                let tip = if on {
+                    format!(
+                        "Карта следует за диском через журнал USN NTFS. Применено изменений: {} · файлов затронуто: {events}\nНе удалось разместить: {} · пропущено при перегрузке: {dropped}\nЕсли два последних числа растут, нажмите F5. Нажмите, чтобы выключить.",
+                        self.live.applied, self.live.unplaced
+                    )
+                } else {
+                    "Следить за изменениями на диске (журнал USN): карта будет перестраиваться, когда что-то пишет гигабайты. Нажмите, чтобы включить.".to_owned()
+                };
+                if ui.add(egui::Button::new(text).frame(false)).on_hover_text(tip).clicked() {
+                    toggle_live = true;
+                }
+            }
             if !self.message.is_empty() {
                 ui.colored_label(ui.visuals().error_fg_color, &self.message);
             }
@@ -272,6 +298,17 @@ impl App {
                 });
             }
         });
+        if toggle_live {
+            let ctx = ui.ctx().clone();
+            if self.live.active() {
+                self.stop_live();
+                self.settings.live_monitor = false;
+            } else {
+                self.start_live(&ctx);
+                self.settings.live_monitor = self.live.active();
+            }
+            self.settings.save();
+        }
     }
 
     pub fn welcome(&mut self, ui: &mut Ui) {

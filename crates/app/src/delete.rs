@@ -1,5 +1,6 @@
 //! Deleting files and folders from the app: confirmation dialog, background worker, tree update.
 
+use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -89,19 +90,58 @@ fn remove_file_progress(p: &Path, done: &AtomicU64) -> Result<(), String> {
     r
 }
 
-/// Depth-first removal that keeps going after an error and reports the first one.
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// Junctions, directory symlinks, mount points and cloud placeholders: entries whose contents are not stored in
+/// this directory. They are removed as a single entry and never entered, or an elevated delete would wipe whatever
+/// the link points at (`%TEMP%\x -> C:\Windows\System32`).
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Removes the link itself. A directory link needs RemoveDirectoryW (`remove_dir`), which never looks inside it.
+fn remove_link_progress(p: &Path, meta: &std::fs::Metadata, done: &AtomicU64) -> Result<(), String> {
+    if meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        let r = std::fs::remove_dir(p).map_err(|e| e.to_string());
+        if r.is_ok() {
+            done.fetch_add(FILE_COST, Relaxed);
+        }
+        r
+    } else {
+        remove_file_progress(p, done)
+    }
+}
+
+/// Removes one entry of any kind without following links. `meta` must come from `symlink_metadata` (or a
+/// `DirEntry`), not from a call that resolves the link.
+fn remove_entry_progress(
+    p: &Path,
+    meta: &std::fs::Metadata,
+    done: &AtomicU64,
+    current: &Mutex<String>,
+) -> Result<(), String> {
+    if is_reparse_point(meta) {
+        *current.lock().unwrap() = p.to_string_lossy().into_owned();
+        remove_link_progress(p, meta, done)
+    } else if meta.is_dir() {
+        remove_dir_progress(p, done, current)
+    } else {
+        *current.lock().unwrap() = p.to_string_lossy().into_owned();
+        remove_file_progress(p, done)
+    }
+}
+
+/// Depth-first removal that keeps going after an error and reports the first one. `dir` itself must not be a
+/// reparse point (see [`remove_entry_progress`]).
 fn remove_dir_progress(dir: &Path, done: &AtomicU64, current: &Mutex<String>) -> Result<(), String> {
     let mut first_err = None;
     match std::fs::read_dir(dir) {
         Ok(rd) => {
             for entry in rd.flatten() {
-                let path = entry.path();
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                let r = if is_dir {
-                    remove_dir_progress(&path, done, current)
-                } else {
-                    *current.lock().unwrap() = path.to_string_lossy().into_owned();
-                    remove_file_progress(&path, done)
+                let r = match entry.metadata() {
+                    Ok(meta) => remove_entry_progress(&entry.path(), &meta, done, current),
+                    Err(e) => Err(e.to_string()),
                 };
                 if let Err(e) = r {
                     first_err.get_or_insert(e);
@@ -148,6 +188,10 @@ fn top_level(tree: &Tree, ids: &[NodeId]) -> Vec<NodeId> {
 impl App {
     pub fn request_delete(&mut self, ids: Vec<NodeId>, permanent: bool) {
         let Some(data) = self.data.clone() else { return };
+        if self.compress.running() {
+            self.toast("Дождитесь окончания сжатия", ToastKind::Info);
+            return;
+        }
         let tree = &data.out.tree;
         let ids = top_level(tree, &ids);
         if ids.is_empty() {
@@ -276,10 +320,9 @@ impl App {
                     let p = fs.as_path();
                     let before = d2.load(Relaxed);
                     let res = if permanent {
-                        if p.is_dir() && !p.is_symlink() {
-                            remove_dir_progress(p, &d2, &c2)
-                        } else {
-                            remove_file_progress(p, &d2)
+                        match std::fs::symlink_metadata(p) {
+                            Ok(meta) => remove_entry_progress(p, &meta, &d2, &c2),
+                            Err(e) => Err(e.to_string()),
                         }
                     } else if !recycle_safe(&path) {
                         Err(
@@ -604,6 +647,45 @@ mod tests {
         assert!(verbatim(r"d\keep").exists());
         assert!(std::fs::symlink_metadata(verbatim("d ")).is_err());
         let _ = std::fs::remove_dir_all(format!(r"\\?\{base}"));
+    }
+
+    fn mklink_junction(link: &Path, target: &Path) {
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed");
+    }
+
+    /// A junction inside a deleted folder must be unlinked, not followed: its target keeps its files.
+    #[cfg(windows)]
+    #[test]
+    fn junction_is_removed_without_touching_its_target() {
+        let base = std::env::temp_dir().join(format!("spacetree-junction-test-{}", std::process::id()));
+        let (victim, doomed) = (base.join("victim"), base.join("doomed"));
+        std::fs::create_dir_all(victim.join("sub")).unwrap();
+        std::fs::write(victim.join("sub").join("precious.txt"), b"keep").unwrap();
+        std::fs::create_dir_all(&doomed).unwrap();
+        std::fs::write(doomed.join("junk.txt"), b"x").unwrap();
+        mklink_junction(&doomed.join("link"), &victim);
+
+        let done = AtomicU64::new(0);
+        let cur = Mutex::default();
+        let meta = std::fs::symlink_metadata(&doomed).unwrap();
+        remove_entry_progress(&doomed, &meta, &done, &cur).unwrap();
+        assert!(std::fs::symlink_metadata(&doomed).is_err());
+        assert_eq!(std::fs::read(victim.join("sub").join("precious.txt")).unwrap(), b"keep");
+
+        // A junction handed over as the top-level item is unlinked as well.
+        let link2 = base.join("link2");
+        mklink_junction(&link2, &victim);
+        let meta = std::fs::symlink_metadata(&link2).unwrap();
+        remove_entry_progress(&link2, &meta, &done, &cur).unwrap();
+        assert!(std::fs::symlink_metadata(&link2).is_err());
+        assert!(victim.join("sub").join("precious.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

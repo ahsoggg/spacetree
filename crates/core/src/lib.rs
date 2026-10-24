@@ -5,6 +5,7 @@ pub mod dupes;
 pub mod error;
 pub mod export;
 pub mod ntfs;
+pub mod orphans;
 pub mod progress;
 pub mod scan;
 pub mod snapshot;
@@ -15,13 +16,18 @@ pub mod walk;
 #[cfg(windows)]
 pub mod carve;
 #[cfg(windows)]
+pub mod compress;
+#[cfg(windows)]
 pub mod mft;
 #[cfg(windows)]
 pub mod undelete;
 #[cfg(windows)]
+pub mod usn;
+#[cfg(windows)]
 mod winapi;
 
 pub use error::ScanError;
+pub use ntfs::{NO_NODE, StreamInfo, UsnPos};
 pub use progress::Progress;
 pub use scan::{Backend, ScanOutput, Selection, Timings, Used, drive_of_root, scan, select_backend};
 pub use tree::{Kind, NodeId, ROOT, Tree};

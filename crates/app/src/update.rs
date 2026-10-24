@@ -1,7 +1,9 @@
 //! Self-update from GitHub releases.
 //!
-//! The latest release must carry `SpaceTree.exe` and `SpaceTree.exe.sha256` assets. The new exe is
-//! downloaded next to the running one, its SHA-256 is verified, then the files are swapped: Windows lets
+//! The latest release must carry `SpaceTree.exe`, `SpaceTree.exe.sha256` and `SpaceTree.exe.sig` assets. The new
+//! exe is downloaded next to the running one; its SHA-256 must match the published one and, what actually
+//! authenticates it, carry a valid Ed25519 signature (`release_sig`) from the key built into this exe — a hash
+//! from the same release proves nothing if the release itself was tampered with. Then the files are swapped: Windows lets
 //! a running executable be renamed (not overwritten), so the old one becomes `SpaceTree.exe.old` and is
 //! deleted on the next start. The new version runs after a restart.
 
@@ -14,6 +16,9 @@ use sha2::{Digest, Sha256};
 const API: &str = "https://api.github.com/repos/ahsoggg-creator/spacetree/releases/latest";
 const EXE_ASSET: &str = "SpaceTree.exe";
 const SUM_ASSET: &str = "SpaceTree.exe.sha256";
+const SIG_ASSET: &str = "SpaceTree.exe.sig";
+/// The checksum and signature files are a few hundred bytes; anything bigger is not one.
+const MAX_SMALL_ASSET: u64 = 4096;
 /// Do not ask GitHub more often than this (anonymous API limit is 60 requests per hour).
 pub const CHECK_INTERVAL_SECS: u64 = 6 * 3600;
 /// Download cap when GitHub does not announce the asset size.
@@ -49,6 +54,7 @@ struct Release {
     exe_url: String,
     exe_size: u64,
     sum_url: String,
+    sig_url: String,
 }
 
 fn agent() -> ureq::Agent {
@@ -112,12 +118,14 @@ fn latest() -> Result<Release, String> {
     };
     let (exe_url, exe_size) = asset(EXE_ASSET).ok_or("в релизе нет SpaceTree.exe")?;
     let (sum_url, _) = asset(SUM_ASSET).ok_or("в релизе нет контрольной суммы")?;
+    let (sig_url, _) = asset(SIG_ASSET).ok_or("в релизе нет подписи")?;
     Ok(Release {
         version: tag.trim_start_matches('v').to_owned(),
         page: v["html_url"].as_str().unwrap_or(crate::winint::REPO_URL).to_owned(),
         exe_url,
         exe_size,
         sum_url,
+        sig_url,
     })
 }
 
@@ -140,18 +148,26 @@ fn dir_writable(dir: &Path) -> bool {
     ok
 }
 
+/// Text of a tiny release asset (checksum, signature), capped so a hostile server cannot make us buffer a lot.
+fn fetch_small(url: &str) -> Result<String, String> {
+    let mut resp = agent()
+        .get(url)
+        .header("User-Agent", &ua())
+        .call()
+        .map_err(|e| e.to_string())?;
+    resp.body_mut()
+        .with_config()
+        .limit(MAX_SMALL_ASSET)
+        .read_to_string()
+        .map_err(|e| e.to_string())
+}
+
 fn download(rel: &Release, state: &Shared, repaint: &dyn Fn()) -> Result<(), String> {
     let exe = target_exe()?;
     let tmp = exe.with_extension("exe.download");
 
-    let sum_text = agent()
-        .get(&rel.sum_url)
-        .header("User-Agent", &ua())
-        .call()
-        .map_err(|e| e.to_string())?
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
+    let sum_text = fetch_small(&rel.sum_url)?;
+    let sig_text = fetch_small(&rel.sig_url)?;
     let expected = sum_text
         .split_whitespace()
         .next()
@@ -204,6 +220,11 @@ fn download(rel: &Release, state: &Shared, repaint: &dyn Fn()) -> Result<(), Str
     if got != expected {
         let _ = std::fs::remove_file(&tmp);
         return Err("контрольная сумма не совпала — обновление отменено".into());
+    }
+    // The signature covers the hash of what was actually downloaded, not the one the release claims.
+    if let Err(e) = crate::release_sig::verify_release(&rel.version, &got, &sig_text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
 
     let old = exe.with_extension("exe.old");

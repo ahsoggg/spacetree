@@ -33,6 +33,8 @@ pub struct Settings {
     pub confirm_delete: bool,
     /// Save a snapshot of every scan to show what has grown since.
     pub save_snapshots: bool,
+    /// Follow changes on disk while the program is open (NTFS change journal; MFT scans only).
+    pub live_monitor: bool,
 }
 
 impl Default for Settings {
@@ -44,6 +46,7 @@ impl Default for Settings {
             color_by_age: false,
             confirm_delete: true,
             save_snapshots: true,
+            live_monitor: false,
         }
     }
 }
